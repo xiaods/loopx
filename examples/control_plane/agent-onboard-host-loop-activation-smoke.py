@@ -459,6 +459,38 @@ def main() -> int:
             "loopx_goal_activate"
         )
 
+        pi_onboarding = build_agent_onboarding_packet(
+            project=project,
+            agent_type="pi",
+            goal_id="multi-agent-goal",
+            agent_id="codex-product-capability",
+            cli_bin=cli_bin,
+        )
+        pi_facade = pi_onboarding["commands"]["install_command_facade"]
+        assert "--surface pi" in pi_facade, pi_facade
+        # The Pi install command must use the CLI's public --pi-project flag
+        # with the resolved project, so it parses and targets the right
+        # project even when agent-onboard runs from another cwd.
+        assert f"--pi-project {shlex.quote(str(project.resolve()))}" in pi_facade, pi_facade
+        assert "--project ." not in pi_facade, pi_facade
+        # Execute the returned setup command from a different cwd (run_cli
+        # always runs from REPO_ROOT, not the temp project): it must parse and
+        # land in the project's .pi/extensions/.
+        pi_install = json.loads(
+            run_cli(*shlex.split(pi_facade)[1:]).stdout
+        )
+        assert pi_install["ok"] is True, pi_install
+        assert (project / ".pi" / "extensions" / "loopx-goal.ts").is_file()
+        pi_runtime = project / ".pi" / "extensions" / "pi-goal-loop-runtime.mjs"
+        assert pi_runtime.is_file()
+        # The quota/wait/store loop core lives in the runtime module; the
+        # adapter only wires Pi events into it.
+        assert "pi.on(\"session_shutdown\"" not in pi_runtime.read_text(encoding="utf-8")
+        assert "terminal_no_followup" in pi_runtime.read_text(encoding="utf-8")
+        assert pi_onboarding["host_loop_activation"]["host_mutation"]["host_tool"] == (
+            "loopx_goal_activate"
+        )
+
         other_agent_onboarding = build_agent_onboarding_packet(
             project=project,
             agent_type="other-agent",
@@ -544,6 +576,20 @@ def main() -> int:
         assert "project-skill status" in quality_commands[0]["status"]
         assert "project-skill install" in quality_commands[0]["apply_install"]
         assert quality_commands[0]["apply_install"].endswith("--execute")
+
+        quality_pi = build_agent_onboarding_packet(
+            project=project,
+            agent_type="pi",
+            goal_id="multi-agent-goal",
+            agent_id="codex-product-capability",
+            cli_bin=cli_bin,
+        )
+        pi_quality_commands = quality_pi["skill_delivery"]["project_skill_commands"]
+        assert len(pi_quality_commands) == 1, quality_pi
+        assert pi_quality_commands[0]["surface"] == "pi", quality_pi
+        assert "project-skill status" in pi_quality_commands[0]["status"]
+        assert "--surface pi" in pi_quality_commands[0]["apply_install"], quality_pi
+        assert pi_quality_commands[0]["apply_install"].endswith("--execute"), quality_pi
 
         doctor_home = root / "doctor-home"
         doctor_home.mkdir()
