@@ -31,7 +31,7 @@ import {
   createBindingStore,
   createEphemeralSessionIdentity,
   createGoalLoop,
-  sanitizedKey,
+  sessionKey,
 } from "./pi-goal-loop-runtime.mjs";
 
 const execFile = promisify(execFileCallback);
@@ -71,7 +71,9 @@ export default function (pi: ExtensionAPI) {
 
   const keyFor = (ctx: ExtensionContext) => {
     const file = ctx.sessionManager.getSessionFile();
-    return file ? sanitizedKey(file) : ephemeral.key;
+    // Use the full path digest so two files whose first 161 bytes collide
+    // never produce the same durable key.
+    return file ? sessionKey(file) : ephemeral.key;
   };
   // Sessions without a session file (pi --no-session is ephemeral) get a
   // unique in-memory identity per extension instance: the binding is never

@@ -19,7 +19,7 @@
 // - Sessions without a session file (pi --no-session, ephemeral) use a unique
 //   in-memory identity per extension instance and are never persisted, so a
 //   later run cannot inherit the previous run's binding.
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { promises as fs } from "node:fs"
 import path from "node:path"
 
@@ -33,6 +33,16 @@ export function sanitizedKey(value) {
     .replace(/[^A-Za-z0-9_-]/g, "_")
     .slice(0, 160)
   return cleaned || "session"
+}
+
+// Collision-resistant session key from the full session file path. Uses a
+// short human-readable basename prefix plus a SHA-256 digest of the complete
+// path so two files whose first 161 bytes are identical never produce the
+// same durable key.
+export function sessionKey(sessionFile) {
+  const digest = createHash("sha256").update(sessionFile).digest("hex").slice(0, 16)
+  const label = sanitizedKey(path.basename(sessionFile))
+  return label ? `${label}-${digest}` : `session-${digest}`
 }
 
 export function stateRoot(directory) {
@@ -256,6 +266,10 @@ export function createGoalLoop(options) {
   const timers = new Map()
   const evaluations = new Map()
   const contexts = new Map()
+  // Per-key generation: every activate() increments the generation for its
+  // key so that an evaluation already in-flight for the same key detects the
+  // mismatch before committing any stale write or sending an old task body.
+  const keyGenerations = new Map()
   let disposed = false
   let epoch = 0
 
@@ -314,6 +328,11 @@ export function createGoalLoop(options) {
       return
     }
 
+    // Capture the per-key generation so we can detect a re-activation that
+    // happens while this evaluation is in-flight.
+    const capturedGen = keyGenerations.get(key) || 0
+    const capturedGoalId = binding.goalId
+
     let decision
     try {
       decision = await quotaProbe(binding)
@@ -331,13 +350,17 @@ export function createGoalLoop(options) {
       !current ||
       current.terminal ||
       current.autoResume === false ||
-      current.goalId !== binding.goalId
+      current.goalId !== capturedGoalId
     ) {
       cancelScheduled(key)
       return
     }
 
     if (isTerminalNoFollowup(decision)) {
+      if (keyGenerations.get(key) !== capturedGen) {
+        cancelScheduled(key)
+        return
+      }
       await store.write(key, { terminal: true, autoResume: false })
       if (disposed || epoch !== instanceEpoch) return
       cancelScheduled(key)
@@ -350,17 +373,30 @@ export function createGoalLoop(options) {
 
     if (shouldRunNow(decision)) {
       cancelScheduled(key)
+      if (keyGenerations.get(key) !== capturedGen) return
       await store.write(key, { schedulerToken: "", unchangedPolls: 0 })
+      // If the in-flight write raced with activate(), the generation has
+      // already moved; abort before any further side effect.
+      if (keyGenerations.get(key) !== capturedGen) {
+        cancelScheduled(key)
+        return
+      }
       if (disposed || epoch !== instanceEpoch) return
       const prompt = current.taskBody || current.goalId
+      if (keyGenerations.get(key) !== capturedGen) return
       await store.write(key, { lastInjectedPrompt: prompt })
       if (disposed || epoch !== instanceEpoch) return
+      if (keyGenerations.get(key) !== capturedGen) return
       sendMessage(prompt)
       return
     }
 
     const wait = waitPlan(decision, current)
     if (wait.stop) {
+      cancelScheduled(key)
+      return
+    }
+    if (keyGenerations.get(key) !== capturedGen) {
       cancelScheduled(key)
       return
     }
@@ -397,6 +433,9 @@ export function createGoalLoop(options) {
       if (disposed) return null
       const services = contexts.get(key)
       if (!services) throw new Error("loopx_goal_activate requires a bound session context")
+      // Increment the per-key generation so every in-flight evaluation for
+      // this key aborts before writing or sending its old task body.
+      keyGenerations.set(key, (keyGenerations.get(key) || 0) + 1)
       const binding = await services.store.write(key, fields)
       if (disposed) return null
       cancelScheduled(key)

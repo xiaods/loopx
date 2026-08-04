@@ -12,6 +12,7 @@ import {
   createGoalLoop,
   createMemoryBindingStore,
   sanitizedKey,
+  sessionKey,
   waitPlan,
 } from "../loopx/pi_goal_mode/pi-goal-loop-runtime.mjs"
 
@@ -512,6 +513,121 @@ test("ephemeral sessions never inherit the previous run's binding", async () => 
   assert.equal(run2.calls.quota, 0)
   assert.equal(run2.calls.send, 0)
   assert.equal(await identity2.store.read(identity2.key), null)
+})
+
+
+test("activation during a stale run_now branch prevents stale writes and messages", async () => {
+  // Gated store: the first post-activation write (schedulerToken) blocks
+  // instead of returning immediately, giving activate() a chance to advance
+  // the per-key generation before the old evaluation continues.
+  let releaseWrite
+  const gate = new Promise((resolve) => {
+    releaseWrite = resolve
+  })
+  const inner = createMemoryBindingStore()
+  let writeCalls = 0
+  let markWriteBlocked
+  const writeBlockedPromise = new Promise((resolve) => {
+    markWriteBlocked = resolve
+  })
+  const gatedStore = {
+    async read(key) {
+      return inner.read(key)
+    },
+    async write(key, changes) {
+      const index = writeCalls++
+      if (index === 1) {
+        markWriteBlocked()
+        await gate
+      }
+      return inner.write(key, changes)
+    },
+    async remove(key) {
+      return inner.remove(key)
+    },
+  }
+
+  const calls = { send: 0, quota: 0, notify: 0, messages: [] }
+  const scheduled = []
+  const loop = createGoalLoop({
+    quotaProbe: async () => {
+      calls.quota += 1
+      return { should_run: true, scheduler_hint: { action: "run_now" } }
+    },
+    sendMessage: (msg) => {
+      calls.send += 1
+      calls.messages.push(msg)
+    },
+    setTimer: (cb, ms) => {
+      const t = { cb, cleared: false, delayMs: ms }
+      scheduled.push(t)
+      return t
+    },
+    clearTimer: (t) => {
+      t.cleared = true
+    },
+  })
+  loop.bind("session-race", {
+    store: gatedStore,
+    isIdle: () => true,
+    notify: () => {
+      calls.notify++
+    },
+  })
+
+  // Activate old goal (write #0, generation -> 1).
+  await loop.activate("session-race", { goalId: "old-goal", taskBody: "old-body" })
+  assert.equal(calls.notify, 1)
+
+  // Start settle; the probe returns run_now and the scheduler write blocks.
+  // Wait for the write to start (so activate cannot preempt it).
+  const settled = loop.settle("session-race")
+  await writeBlockedPromise
+  assert.equal(calls.quota, 1)
+
+  // Now the old evaluation's first branch write is in-flight.  Activate a
+  // new goal for the same key — this bumps the per-key generation.
+  await loop.activate("session-race", { goalId: "new-goal", taskBody: "new-body" })
+  assert.equal(calls.notify, 2)
+
+  // Release the old write and let the evaluation continue.
+  releaseWrite()
+  await settled
+
+  // The stale evaluation must not write lastInjectedPrompt or send the old
+  // task body after the generation moved.
+  assert.equal(calls.send, 0)
+  const binding = await inner.read("session-race")
+  assert.equal(binding.goalId, "new-goal")
+  assert.notEqual(binding.lastInjectedPrompt, "old-body")
+})
+
+
+test("session keys use a collision-resistant digest of the full path", () => {
+  const a = sessionKey("/long/common/prefix/session-a.json")
+  const b = sessionKey("/long/common/prefix/session-b.json")
+  assert.notEqual(a, b)
+  assert.match(a, /-/)
+  assert.match(b, /-/)
+})
+
+
+test("session keys do not collide on long common prefixes", () => {
+  const prefix = "/" + "x".repeat(200) + "/session"
+  const a = sessionKey(prefix + "-a.json")
+  const b = sessionKey(prefix + "-b.json")
+  // Basename labels may be identical after sanitization; the digest
+  // distinguishes them.
+  assert.notEqual(a, b)
+})
+
+
+test("different session keys never read each other's bindings", async () => {
+  const keyA = sessionKey("/workspace/.pi/sessions/session-a.json")
+  const keyB = sessionKey("/workspace/.pi/sessions/session-b.json")
+  const store = createMemoryBindingStore()
+  await store.write(keyA, { goalId: "goal-a", taskBody: "body-a" })
+  assert.equal(await store.read(keyB), null)
 })
 
 
