@@ -47,6 +47,11 @@ resolved project automatically.
 Bindings persist under `<project>/.loopx/pi/` (gitignored), keyed by session.
 Override with `LOOPX_PI_STATE_DIR`. Invoke the CLI binary via `LOOPX_BIN`.
 
+Sessions without a session file (`pi --no-session`) are ephemeral: the
+adapter uses a unique in-memory identity per extension instance and never
+persists its binding, so a later `--no-session` run cannot inherit the
+previous run's goal and must activate again through `loopx_goal_activate`.
+
 ## Boundary
 
 The extension reads only LoopX public-safe state and never copies raw

@@ -12,9 +12,14 @@
 //   self-declares closure.
 // - Quota probe failures fail closed with a bounded retry instead of guessing.
 // - dispose() atomically invalidates the extension instance: every timer is
-//   cancelled and an in-flight quota probe that returns afterwards stops at
-//   the disposed guard instead of sending the old task body or rescheduling
-//   past a reload / session-replacement boundary.
+//   cancelled, and an evaluation that is mid-flight across an await returns to
+//   an epoch guard before any write / notify / send / timer side effect, so it
+//   can never continue the old session past a reload / session-replacement
+//   boundary.
+// - Sessions without a session file (pi --no-session, ephemeral) use a unique
+//   in-memory identity per extension instance and are never persisted, so a
+//   later run cannot inherit the previous run's binding.
+import { randomUUID } from "node:crypto"
 import { promises as fs } from "node:fs"
 import path from "node:path"
 
@@ -94,6 +99,54 @@ export function createBindingStore(directory) {
         if (error?.code !== "ENOENT") throw error
       }
     },
+  }
+}
+
+// In-memory binding store for ephemeral sessions: nothing ever reaches the
+// filesystem, so a `pi --no-session` run cannot leak a binding to a later run.
+export function createMemoryBindingStore() {
+  const bindings = new Map()
+  return {
+    bindings,
+    async read(key) {
+      return bindings.get(key) || null
+    },
+    async write(key, changes) {
+      const current = bindings.get(key) || {}
+      const payload = {
+        schemaVersion: BRIDGE_SCHEMA_VERSION,
+        sessionKey: key,
+        directory: "",
+        goalId: "",
+        agentId: "",
+        registryPath: "",
+        availableCapabilities: [],
+        taskBody: "",
+        autoResume: true,
+        terminal: false,
+        schedulerToken: "",
+        unchangedPolls: 0,
+        lastInjectedPrompt: "",
+        ...current,
+        ...changes,
+      }
+      bindings.set(key, payload)
+      return payload
+    },
+    async remove(key) {
+      bindings.delete(key)
+    },
+  }
+}
+
+// Per-extension-instance identity for sessions without a session file. Every
+// instance gets a unique key and its own in-memory store, so consecutive
+// `--no-session` runs can never inherit a previous run's binding; the current
+// run must activate the goal again through loopx_goal_activate.
+export function createEphemeralSessionIdentity() {
+  return {
+    key: `ephemeral-${randomUUID()}`,
+    store: createMemoryBindingStore(),
   }
 }
 
@@ -194,14 +247,17 @@ export function waitPlan(decision, binding) {
 //   clearTimer(handle)       cancel a scheduled timer
 //
 // The loop keeps per-session timers and evaluations but owns one instance-wide
-// disposed flag, so session shutdown atomically invalidates every session's
-// scheduled work at once.
+// epoch, so session shutdown atomically invalidates every session's scheduled
+// and in-flight work at once. Every await that can return control to the event
+// loop is followed by an epoch check before any write / notify / send / timer
+// side effect.
 export function createGoalLoop(options) {
   const { quotaProbe, sendMessage, setTimer, clearTimer } = options
   const timers = new Map()
   const evaluations = new Map()
   const contexts = new Map()
   let disposed = false
+  let epoch = 0
 
   const cancelScheduled = (key) => {
     const timer = timers.get(key)
@@ -218,9 +274,10 @@ export function createGoalLoop(options) {
   const scheduleEvaluation = (key, minutes) => {
     if (disposed) return
     cancelScheduled(key)
+    const scheduledEpoch = epoch
     const timer = setTimer(async () => {
       timers.delete(key)
-      if (disposed) return
+      if (disposed || epoch !== scheduledEpoch) return
       try {
         await evaluateIdle(key)
       } catch {
@@ -233,6 +290,7 @@ export function createGoalLoop(options) {
 
   const evaluateIdleOnce = async (key) => {
     if (disposed) return
+    const instanceEpoch = epoch
     const services = contexts.get(key)
     if (!services) {
       cancelScheduled(key)
@@ -246,6 +304,7 @@ export function createGoalLoop(options) {
       cancelScheduled(key)
       return
     }
+    if (disposed || epoch !== instanceEpoch) return
     if (!binding || binding.terminal) {
       cancelScheduled(key)
       return
@@ -259,13 +318,15 @@ export function createGoalLoop(options) {
     try {
       decision = await quotaProbe(binding)
     } catch {
+      if (disposed || epoch !== instanceEpoch) return
       // Fail closed: never continue without LoopX authority. Bounded retry.
       scheduleEvaluation(key, DEFAULT_RETRY_MINUTES)
       return
     }
-    if (disposed) return
+    if (disposed || epoch !== instanceEpoch) return
 
     const current = await store.read(key)
+    if (disposed || epoch !== instanceEpoch) return
     if (
       !current ||
       current.terminal ||
@@ -278,6 +339,7 @@ export function createGoalLoop(options) {
 
     if (isTerminalNoFollowup(decision)) {
       await store.write(key, { terminal: true, autoResume: false })
+      if (disposed || epoch !== instanceEpoch) return
       cancelScheduled(key)
       services.notify(
         `LoopX goal ${current.goalId} reached validated terminal no-follow-up; loop stopped.`,
@@ -289,8 +351,10 @@ export function createGoalLoop(options) {
     if (shouldRunNow(decision)) {
       cancelScheduled(key)
       await store.write(key, { schedulerToken: "", unchangedPolls: 0 })
+      if (disposed || epoch !== instanceEpoch) return
       const prompt = current.taskBody || current.goalId
       await store.write(key, { lastInjectedPrompt: prompt })
+      if (disposed || epoch !== instanceEpoch) return
       sendMessage(prompt)
       return
     }
@@ -304,6 +368,7 @@ export function createGoalLoop(options) {
       schedulerToken: wait.schedulerToken,
       unchangedPolls: wait.unchangedPolls,
     })
+    if (disposed || epoch !== instanceEpoch) return
     scheduleEvaluation(key, wait.minutes)
   }
 
@@ -329,9 +394,11 @@ export function createGoalLoop(options) {
       cancelScheduled(key)
     },
     async activate(key, fields) {
+      if (disposed) return null
       const services = contexts.get(key)
       if (!services) throw new Error("loopx_goal_activate requires a bound session context")
       const binding = await services.store.write(key, fields)
+      if (disposed) return null
       cancelScheduled(key)
       services.notify(
         `LoopX goal ${binding.goalId} activated; continuation gated by LoopX quota.`,
@@ -341,6 +408,7 @@ export function createGoalLoop(options) {
     },
     async settle(key) {
       if (disposed) return
+      const instanceEpoch = epoch
       const services = contexts.get(key)
       if (!services) return
       let binding = null
@@ -349,11 +417,13 @@ export function createGoalLoop(options) {
       } catch {
         return
       }
+      if (disposed || epoch !== instanceEpoch) return
       if (!binding || binding.terminal || binding.autoResume === false) return
       await evaluateIdle(key)
     },
     async userPrompt(key, prompt) {
       if (disposed) return
+      const instanceEpoch = epoch
       const services = contexts.get(key)
       if (!services) return
       let binding = null
@@ -362,26 +432,32 @@ export function createGoalLoop(options) {
       } catch {
         return
       }
+      if (disposed || epoch !== instanceEpoch) return
       if (!binding || binding.terminal) return
       if (String(prompt || "") !== binding.lastInjectedPrompt) {
         await services.store.write(key, { autoResume: false })
+        if (disposed || epoch !== instanceEpoch) return
         cancelScheduled(key)
       }
     },
     async resume(key) {
+      if (disposed) return null
       const services = contexts.get(key)
       if (!services) return null
       const binding = await services.store.write(key, { autoResume: true, terminal: false })
+      if (disposed) return null
       cancelScheduled(key)
       services.notify(`LoopX goal ${binding.goalId} auto-continuation resumed.`, "info")
       return binding
     },
     // Session shutdown / session replacement: atomically invalidate this
     // extension instance and cancel every timer. A quota probe that is
-    // already in flight returns to the disposed guard, so it cannot send the
-    // old task body or reschedule a timer past the boundary.
+    // already in flight — or an evaluation suspended on any later store
+    // await — returns to the epoch guard, so it cannot write, notify, send
+    // the old task body, or reschedule a timer past the boundary.
     dispose() {
       disposed = true
+      epoch += 1
       cancelAll()
     },
   }

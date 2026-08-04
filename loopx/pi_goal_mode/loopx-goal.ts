@@ -29,6 +29,7 @@ import { Type } from "typebox";
 import {
   buildQuotaArgs,
   createBindingStore,
+  createEphemeralSessionIdentity,
   createGoalLoop,
   sanitizedKey,
 } from "./pi-goal-loop-runtime.mjs";
@@ -68,9 +69,17 @@ export default function (pi: ExtensionAPI) {
     );
   });
 
-  const keyFor = (ctx: ExtensionContext) =>
-    sanitizedKey(ctx.sessionManager.getSessionFile() ?? "session");
-  const storeFor = (ctx: ExtensionContext) => createBindingStore(ctx.cwd);
+  const keyFor = (ctx: ExtensionContext) => {
+    const file = ctx.sessionManager.getSessionFile();
+    return file ? sanitizedKey(file) : ephemeral.key;
+  };
+  // Sessions without a session file (pi --no-session is ephemeral) get a
+  // unique in-memory identity per extension instance: the binding is never
+  // persisted, so a later run cannot inherit a previous run's goal.
+  const storeFor = (ctx: ExtensionContext) => {
+    const file = ctx.sessionManager.getSessionFile();
+    return file ? createBindingStore(ctx.cwd) : ephemeral.store;
+  };
 
   // One loop per extension instance. Session services (store, idle probe,
   // notify) are bound per key on every event, and `session_shutdown` disposes
@@ -89,6 +98,9 @@ export default function (pi: ExtensionAPI) {
     },
     clearTimer: (timer: NodeJS.Timeout) => clearTimeout(timer),
   });
+  // One unique, non-persisted identity per extension instance for ephemeral
+  // sessions; declared here so keyFor/storeFor stay stable within the run.
+  const ephemeral = createEphemeralSessionIdentity();
 
   const bindContext = (ctx: ExtensionContext) => {
     const key = keyFor(ctx);

@@ -515,10 +515,11 @@ def test_pi_install_does_not_touch_default_all_surfaces(tmp_path: Path) -> None:
     assert not (tmp_path / ".pi" / "extensions" / "pi-goal-loop-runtime.mjs").exists()
 
 
-def test_pi_install_preserves_user_owned_extension(tmp_path: Path) -> None:
+def test_pi_install_blocks_atomically_on_user_owned_extension(tmp_path: Path) -> None:
     extension = tmp_path / ".pi" / "extensions" / "loopx-goal.ts"
     extension.parent.mkdir(parents=True)
     extension.write_text("// user-owned extension\n", encoding="utf-8")
+    runtime = tmp_path / ".pi" / "extensions" / "pi-goal-loop-runtime.mjs"
 
     payload = install_slash_commands(
         execute=True,
@@ -528,8 +529,49 @@ def test_pi_install_preserves_user_owned_extension(tmp_path: Path) -> None:
         pi_project=str(tmp_path),
     )
 
+    # The adapter and its loop runtime are one atomic unit: a user-owned
+    # target fails closed with ok=false and zero writes.
+    assert payload["ok"] is False
     assert extension.read_text(encoding="utf-8") == "// user-owned extension\n"
-    assert _row(payload, "pi_goal_extension")["status"] == "skipped_user_file"
+    assert not runtime.exists()
+    row = _row(payload, "pi_goal_extension")
+    assert row["status"] == "blocked_user_owned_pi_file"
+    assert str(extension) in row["conflicts"]
+
+
+def test_pi_install_blocks_atomically_on_user_owned_runtime(tmp_path: Path) -> None:
+    runtime = tmp_path / ".pi" / "extensions" / "pi-goal-loop-runtime.mjs"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text("// user-owned runtime\n", encoding="utf-8")
+    extension = tmp_path / ".pi" / "extensions" / "loopx-goal.ts"
+
+    payload = install_slash_commands(
+        execute=True,
+        surfaces=["pi"],
+        codex_home=str(tmp_path / "codex"),
+        claude_home=str(tmp_path / "claude"),
+        pi_project=str(tmp_path),
+    )
+
+    assert payload["ok"] is False
+    assert runtime.read_text(encoding="utf-8") == "// user-owned runtime\n"
+    assert not extension.exists()
+    row = _row(payload, "pi_goal_extension")
+    assert row["status"] == "blocked_user_owned_pi_file"
+    assert str(runtime) in row["conflicts"]
+    # No partial unit: neither managed file was written.
+    assert _row_if_present(payload, "pi_goal_extension_runtime") is None
+
+
+def _row_if_present(
+    payload: dict[str, object], mechanism: str
+) -> dict[str, object] | None:
+    installed = payload["installed"]
+    assert isinstance(installed, list)
+    for item in installed:
+        if item.get("mechanism") == mechanism:
+            return item
+    return None
 
 
 def test_pi_install_retires_managed_extension_on_uninstall(tmp_path: Path) -> None:

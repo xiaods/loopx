@@ -8,7 +8,9 @@ import {
   BRIDGE_SCHEMA_VERSION,
   DEFAULT_RETRY_MINUTES,
   createBindingStore,
+  createEphemeralSessionIdentity,
   createGoalLoop,
+  createMemoryBindingStore,
   sanitizedKey,
   waitPlan,
 } from "../loopx/pi_goal_mode/pi-goal-loop-runtime.mjs"
@@ -85,6 +87,50 @@ function backoffDecision() {
           unchanged_poll_limit: 3,
         },
       },
+    },
+  }
+}
+
+
+function gatedStore() {
+  const inner = memoryBindingStore()
+  const writes = []
+  let reads = 0
+  let gate = null
+  let releaseGate = null
+  let markPostProbeReadStarted = null
+  const postProbeReadStarted = new Promise((resolve) => {
+    markPostProbeReadStarted = resolve
+  })
+  return {
+    store: {
+      async read(key) {
+        reads += 1
+        // settle's pre-check and evaluateIdleOnce's binding read happen before
+        // the probe; the third read is the post-probe read.
+        if (reads === 3) {
+          markPostProbeReadStarted()
+          if (gate) await gate
+        }
+        return inner.read(key)
+      },
+      async write(key, changes) {
+        writes.push({ key, changes })
+        return inner.write(key, changes)
+      },
+      async remove(key) {
+        return inner.remove(key)
+      },
+    },
+    writes,
+    postProbeReadStarted,
+    hangPostProbeRead() {
+      gate = new Promise((resolve) => {
+        releaseGate = resolve
+      })
+    },
+    releasePostProbeRead() {
+      if (releaseGate) releaseGate()
     },
   }
 }
@@ -377,6 +423,110 @@ test("binding store round-trips through the filesystem and retires cleanly", asy
   } finally {
     await fs.rm(root, { recursive: true, force: true })
   }
+})
+
+
+test("dispose during the post-probe read stops all side effects when it returns", async () => {
+  const gated = gatedStore()
+  const calls = { send: 0, quota: 0, notify: 0 }
+  const scheduled = []
+  const loop = createGoalLoop({
+    quotaProbe: async () => {
+      calls.quota += 1
+      return { should_run: true, scheduler_hint: { action: "run_now" } }
+    },
+    sendMessage: () => {
+      calls.send += 1
+    },
+    setTimer: (callback, delayMs) => {
+      const timer = { callback, cleared: false, delayMs }
+      scheduled.push(timer)
+      return timer
+    },
+    clearTimer: (timer) => {
+      timer.cleared = true
+    },
+  })
+  loop.bind("session-race", {
+    store: gated.store,
+    isIdle: () => true,
+    notify: () => {
+      calls.notify += 1
+    },
+  })
+  await loop.activate("session-race", { goalId: "goal-race", taskBody: "old body" })
+  const writesBefore = gated.writes.length
+  assert.equal(calls.notify, 1) // only the activation notification
+
+  // quota has already returned; the post-probe read is suspended.
+  gated.hangPostProbeRead()
+  const settled = loop.settle("session-race")
+  await gated.postProbeReadStarted
+  assert.equal(calls.quota, 1)
+
+  // session_shutdown fires while the post-probe read is still pending.
+  loop.dispose()
+  gated.releasePostProbeRead()
+  await settled
+
+  // The evaluation returns to the epoch guard: no write, no notify, no
+  // message, and no timer scheduled past the boundary.
+  assert.equal(gated.writes.length, writesBefore)
+  assert.equal(calls.notify, 1)
+  assert.equal(calls.send, 0)
+  assert.equal(scheduled.length, 0)
+})
+
+
+test("ephemeral session identities are unique per extension instance", () => {
+  const first = createEphemeralSessionIdentity()
+  const second = createEphemeralSessionIdentity()
+  assert.notEqual(first.key, second.key)
+  assert.notEqual(first.store, second.store)
+  assert.match(first.key, /^ephemeral-/)
+})
+
+
+test("ephemeral sessions never inherit the previous run's binding", async () => {
+  // Run 1: an ephemeral pi --no-session process binds old-goal into its own
+  // in-memory identity.
+  const run1 = harness(backoffDecision())
+  const identity1 = createEphemeralSessionIdentity()
+  run1.loop.bind(identity1.key, {
+    store: identity1.store,
+    isIdle: () => true,
+    notify: () => {},
+  })
+  await run1.loop.activate(identity1.key, { goalId: "old-goal", taskBody: "old body" })
+
+  // Run 2: a fresh ephemeral process must start empty — no quota probe, no
+  // continuation of old-goal, no visible binding — and must activate again.
+  const run2 = harness(backoffDecision())
+  const identity2 = createEphemeralSessionIdentity()
+  run2.loop.bind(identity2.key, {
+    store: identity2.store,
+    isIdle: () => true,
+    notify: () => {},
+  })
+  await run2.loop.settle(identity2.key)
+  assert.equal(run2.calls.quota, 0)
+  assert.equal(run2.calls.send, 0)
+  assert.equal(await identity2.store.read(identity2.key), null)
+})
+
+
+test("memory binding store never shares state across instances", async () => {
+  const store = createMemoryBindingStore()
+  const key = "ephemeral-session"
+  assert.equal(await store.read(key), null)
+  await store.write(key, { goalId: "goal-memory" })
+  assert.equal((await store.read(key)).goalId, "goal-memory")
+
+  const fresh = createMemoryBindingStore()
+  assert.equal(await fresh.read(key), null)
+
+  await store.remove(key)
+  assert.equal(await store.read(key), null)
 })
 
 

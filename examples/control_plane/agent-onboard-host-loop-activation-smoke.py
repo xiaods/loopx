@@ -45,6 +45,7 @@ def run_cli(
         text=True,
         capture_output=True,
         env=env,
+        timeout=300,
     )
 
 
@@ -262,6 +263,7 @@ def main() -> int:
             check=True,
             text=True,
             capture_output=True,
+            timeout=120,
         )
         choice_payload = json.loads(choice_run.stdout)
         assert choice_payload["ok"] is True, choice_payload
@@ -364,6 +366,7 @@ def main() -> int:
             check=True,
             text=True,
             capture_output=True,
+            timeout=120,
         )
         app_ssh_prompt = json.loads(app_ssh_prompt_run.stdout)
         assert app_ssh_prompt["ok"] is True, app_ssh_prompt
@@ -412,6 +415,7 @@ def main() -> int:
             check=True,
             text=True,
             capture_output=True,
+            timeout=120,
         )
         app_ssh_quota = json.loads(app_ssh_quota_run.stdout)
         execution_context = app_ssh_quota["scheduler_hint"]["execution_context"]
@@ -438,6 +442,7 @@ def main() -> int:
             check=True,
             text=True,
             capture_output=True,
+            timeout=120,
         )
         cli_prompt = json.loads(cli_prompt_run.stdout)
         assert cli_prompt["interface_budget"]["mode"] == "visible_goal", cli_prompt

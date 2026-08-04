@@ -48,10 +48,12 @@ def test_pi_extension_disposes_the_loop_on_session_shutdown() -> None:
     assert "loop.dispose()" in adapter
     assert 'pi.on("session_shutdown"' in adapter
     # The runtime owns the instance-wide disposed guard after an in-flight
-    # quota probe returns.
+    # quota probe returns, and re-checks the same epoch after every await that
+    # can yield to the event loop (post-probe read, writes).
     assert "disposed = true" in runtime
     assert "cancelAll()" in runtime
     assert "if (disposed) return" in runtime
+    assert "epoch !== instanceEpoch" in runtime
 
 
 def test_pi_extension_never_self_declares_closure() -> None:
@@ -75,7 +77,20 @@ def test_pi_extension_runtime_is_managed_and_directly_executable() -> None:
     assert "node:" in text
     assert "createGoalLoop" in text
     assert "export function createBindingStore" in text
+    assert "export function createMemoryBindingStore" in text
+    assert "export function createEphemeralSessionIdentity" in text
     assert "export function waitPlan" in text
+
+
+def test_pi_extension_uses_ephemeral_identity_without_a_session_file() -> None:
+    adapter = extension_source()
+    runtime = runtime_source()
+    # pi --no-session runs are ephemeral: they must use a unique in-memory
+    # identity per extension instance instead of one persistent 'session' key.
+    assert "createEphemeralSessionIdentity" in runtime
+    assert "createEphemeralSessionIdentity()" in adapter
+    assert "ephemeral.store" in adapter
+    assert "ephemeral.key" in adapter
 
 
 def test_pi_extension_binding_state_stays_private_and_scoped() -> None:
