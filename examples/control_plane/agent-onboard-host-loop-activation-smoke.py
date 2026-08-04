@@ -58,6 +58,7 @@ def main() -> int:
         "codex-cli",
         "claude-code",
         "opencode",
+        "pi",
         "manual",
         "other-agent",
     } <= agent_types
@@ -75,6 +76,8 @@ def main() -> int:
     assert agent_type_for_host_surface("codex-ide") == "codex-ide-plugin"
     assert agent_type_for_host_surface("codex-cli-tui") == "codex-cli"
     assert agent_type_for_host_surface("opencode") == "opencode"
+    assert agent_type_for_host_surface("pi") == "pi"
+    assert agent_type_for_host_surface("pi-tui") == "pi"
     assert agent_type_for_host_surface("ark-managed-agent") == "ark-managed-agent"
 
     codex_app = build_host_loop_activation_packet(agent_type="codex-app", goal_id="demo")
@@ -86,6 +89,7 @@ def main() -> int:
     codex_cli = build_host_loop_activation_packet(agent_type="codex-cli", goal_id="demo")
     claude_code = build_host_loop_activation_packet(agent_type="claude-code", goal_id="demo")
     opencode = build_host_loop_activation_packet(agent_type="opencode", goal_id="demo")
+    pi = build_host_loop_activation_packet(agent_type="pi", goal_id="demo")
     ark_managed_agent = build_host_loop_activation_packet(
         agent_type="ark-managed-agent",
         goal_id="demo",
@@ -115,6 +119,13 @@ def main() -> int:
     assert opencode["activation_method"] == "activate_loopx_opencode_goal_bridge", opencode
     assert opencode["host_mutation"]["host_tool"] == "loopx_goal_activate", opencode
     assert "--runtime-profile generic_cli" in opencode["commands"]["heartbeat_prompt"], opencode
+    assert pi["activation_method"] == "activate_loopx_pi_goal_extension", pi
+    assert pi["host_surface"] == "pi_visible_goal_mode", pi
+    assert pi["host_mutation"]["host_tool"] == "loopx_goal_activate", pi
+    assert pi["host_mutation"]["tool_argument_mapping"]["goalId"] == (
+        "heartbeat_prompt.goal_id"
+    ), pi
+    assert "--runtime-profile generic_cli" in pi["commands"]["heartbeat_prompt"], pi
     assert ark_managed_agent["activation_method"] == "submit_goal_once", ark_managed_agent
     assert ark_managed_agent["host_surface"] == "ark_managed_agent_goal_mode", ark_managed_agent
     gated_activation = build_host_loop_activation_packet(

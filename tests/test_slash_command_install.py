@@ -459,3 +459,84 @@ def test_opencode_install_ignores_commented_jsonc_goal_plugin(
 
     assert payload["ok"] is True
     assert (opencode_home / "plugins" / "loopx-goal.js").exists()
+
+
+def test_pi_install_writes_self_contained_extension_into_project(
+    tmp_path: Path,
+) -> None:
+    payload = install_slash_commands(
+        execute=True,
+        surfaces=["pi"],
+        codex_home=str(tmp_path / "codex"),
+        claude_home=str(tmp_path / "claude"),
+        pi_project=str(tmp_path),
+    )
+
+    assert payload["ok"] is True
+    assert payload["effective_surfaces"] == ["pi"]
+    extension = tmp_path / ".pi" / "extensions" / "loopx-goal.ts"
+    assert payload["summary"]["pi_extension_path"] == str(extension)
+    assert _row(payload, "pi_goal_extension")["status"] == "created"
+    text = extension.read_text(encoding="utf-8")
+    assert "loopx-managed-slash-command:v1 command=/loopx surface=pi-extension" in text
+    assert 'pi.registerCommand("loopx"' in text
+    assert "loopx_goal_activate" in text
+    assert "quota" in text
+    assert "should-run" in text
+    assert "--runtime-profile" in text
+    assert "terminal_no_followup" in text
+    assert "agent_settled" in text
+    # The extension is self-contained: no package.json or node_modules needed.
+    assert not (tmp_path / ".pi" / "extensions" / "package.json").exists()
+
+
+def test_pi_install_does_not_touch_default_all_surfaces(tmp_path: Path) -> None:
+    payload = install_slash_commands(
+        execute=True,
+        surfaces=["all"],
+        codex_home=str(tmp_path / "codex"),
+        claude_home=str(tmp_path / "claude"),
+        pi_project=str(tmp_path),
+    )
+
+    assert payload["effective_surfaces"] == ["codex", "claude-code", "opencode"]
+    assert payload["summary"]["pi_extension_path"] is None
+    assert not (tmp_path / ".pi" / "extensions" / "loopx-goal.ts").exists()
+
+
+def test_pi_install_preserves_user_owned_extension(tmp_path: Path) -> None:
+    extension = tmp_path / ".pi" / "extensions" / "loopx-goal.ts"
+    extension.parent.mkdir(parents=True)
+    extension.write_text("// user-owned extension\n", encoding="utf-8")
+
+    payload = install_slash_commands(
+        execute=True,
+        surfaces=["pi"],
+        codex_home=str(tmp_path / "codex"),
+        claude_home=str(tmp_path / "claude"),
+        pi_project=str(tmp_path),
+    )
+
+    assert extension.read_text(encoding="utf-8") == "// user-owned extension\n"
+    assert _row(payload, "pi_goal_extension")["status"] == "skipped_user_file"
+
+
+def test_pi_install_retires_managed_extension_on_uninstall(tmp_path: Path) -> None:
+    install_slash_commands(
+        execute=True,
+        surfaces=["pi"],
+        pi_project=str(tmp_path),
+    )
+    extension = tmp_path / ".pi" / "extensions" / "loopx-goal.ts"
+    assert extension.exists()
+
+    payload = install_slash_commands(
+        execute=True,
+        uninstall=True,
+        surfaces=["pi"],
+        pi_project=str(tmp_path),
+    )
+
+    assert payload["ok"] is True
+    assert not extension.exists()
+    assert _row(payload, "pi_goal_extension")["status"] == "retired_managed_file"

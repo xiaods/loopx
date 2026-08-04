@@ -43,6 +43,8 @@ def _surface_install_command(agent_type: str, cli_bin: str) -> str | None:
             f"{shell_arg(cli_bin)} slash-commands --install --surface opencode "
             "--with-goal-bridge"
         )
+    if agent_type == "pi":
+        return f"{shell_arg(cli_bin)} slash-commands --install --surface pi --project ."
     return None
 
 
@@ -240,6 +242,7 @@ def _bootstrap_pack_command(
         "codex-cli": "codex-cli-tui",
         "claude-code": "claude-code",
         "opencode": "opencode",
+        "pi": "pi",
         "ark-managed-agent": "ark-managed-agent",
         "manual": "shell",
         "other-agent": "other-agent",
