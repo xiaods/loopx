@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from loopx.pi_goal_mode import extension_source
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from loopx.pi_goal_mode import extension_source, runtime_source
 
 
 def test_pi_extension_source_is_managed_and_self_contained() -> None:
@@ -33,23 +39,57 @@ def test_pi_extension_registers_command_tool_and_events() -> None:
     assert "sendUserMessage" in text
 
 
+def test_pi_extension_disposes_the_loop_on_session_shutdown() -> None:
+    adapter = extension_source()
+    runtime = runtime_source()
+    # session_shutdown must atomically invalidate the extension instance: the
+    # adapter disposes the whole loop instead of only cancelling the current
+    # session timer.
+    assert "loop.dispose()" in adapter
+    assert 'pi.on("session_shutdown"' in adapter
+    # The runtime owns the instance-wide disposed guard after an in-flight
+    # quota probe returns.
+    assert "disposed = true" in runtime
+    assert "cancelAll()" in runtime
+    assert "if (disposed) return" in runtime
+
+
 def test_pi_extension_never_self_declares_closure() -> None:
-    text = extension_source()
+    adapter = extension_source()
+    runtime = runtime_source()
     # Continuation authority stays with LoopX quota should-run.
-    assert "--runtime-profile" in text
-    assert "generic_cli" in text
-    assert "should-run" in text
-    assert "terminal_no_followup" in text
-    assert "validated_goal_closure" in text
-    # No native goal object exists on Pi; the loop must not fake one.
-    assert "goal_complete" not in text
-    assert "self-declares closure" in text
+    assert "--runtime-profile" in runtime
+    assert "generic_cli" in runtime
+    assert "should-run" in runtime
+    assert "terminal_no_followup" in runtime
+    assert "validated_goal_closure" in runtime
+    # The adapter wires the loop to pi.sendUserMessage; neither side fakes a
+    # native goal completion object.
+    assert "sendUserMessage" in adapter
+    assert "goal_complete" not in runtime
+
+
+def test_pi_extension_runtime_is_managed_and_directly_executable() -> None:
+    text = runtime_source()
+    assert "loopx-managed-slash-command:v1 command=/loopx surface=pi-extension-runtime" in text
+    assert "node:" in text
+    assert "createGoalLoop" in text
+    assert "export function createBindingStore" in text
+    assert "export function waitPlan" in text
 
 
 def test_pi_extension_binding_state_stays_private_and_scoped() -> None:
-    text = extension_source()
+    runtime = runtime_source()
     # Bindings persist under the gitignored project .loopx/ tree.
-    assert ".loopx" in text
-    assert "LOOPX_PI_STATE_DIR" in text
-    assert "0o600" in text
-    assert "0o700" in text
+    assert ".loopx" in runtime
+    assert "LOOPX_PI_STATE_DIR" in runtime
+    assert "0o600" in runtime
+    assert "0o700" in runtime
+
+
+def test_pi_goal_loop_runtime_contract() -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required for the Pi goal loop runtime contract")
+    test_file = Path(__file__).with_name("pi_goal_loop_runtime.test.mjs")
+    subprocess.run([node, "--test", str(test_file)], check=True)

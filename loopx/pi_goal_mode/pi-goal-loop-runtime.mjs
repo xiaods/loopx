@@ -1,0 +1,388 @@
+// <!-- loopx-managed-slash-command:v1 command=/loopx surface=pi-extension-runtime -->
+//
+// LoopX Pi goal loop runtime — the pure, directly executable core of the Pi
+// host adapter. The installed extension (loopx-goal.ts) wires Pi's
+// ExtensionAPI into createGoalLoop; node:test drives this same module through
+// injected dependencies (tests/pi_goal_loop_runtime.test.mjs), so the
+// store/quota/wait lifecycle is verified at runtime instead of by string
+// matching.
+//
+// Lifecycle contract:
+// - Only LoopX-derived terminal state stops auto-continuation; the loop never
+//   self-declares closure.
+// - Quota probe failures fail closed with a bounded retry instead of guessing.
+// - dispose() atomically invalidates the extension instance: every timer is
+//   cancelled and an in-flight quota probe that returns afterwards stops at
+//   the disposed guard instead of sending the old task body or rescheduling
+//   past a reload / session-replacement boundary.
+import { promises as fs } from "node:fs"
+import path from "node:path"
+
+export const BRIDGE_SCHEMA_VERSION = "loopx_pi_goal_bridge_v0"
+export const TERMINAL_STATE_SCHEMA_VERSION = "goal_terminal_state_v0"
+export const SOURCE_COMPLETENESS_SCHEMA_VERSION = "goal_terminal_source_completeness_v0"
+export const DEFAULT_RETRY_MINUTES = 3
+
+export function sanitizedKey(value) {
+  const cleaned = String(value || "")
+    .replace(/[^A-Za-z0-9_-]/g, "_")
+    .slice(0, 160)
+  return cleaned || "session"
+}
+
+export function stateRoot(directory) {
+  if (process.env.LOOPX_PI_STATE_DIR) {
+    return path.resolve(process.env.LOOPX_PI_STATE_DIR)
+  }
+  return path.join(directory, ".loopx", "pi")
+}
+
+// File-backed binding store scoped to one project. Bindings live under the
+// gitignored `.loopx/` tree so they survive Pi restarts without touching
+// tracked repository state.
+export function createBindingStore(directory) {
+  const root = stateRoot(directory)
+  const target = (key) => path.join(root, `${sanitizedKey(key)}.json`)
+  return {
+    async read(key) {
+      try {
+        const payload = JSON.parse(await fs.readFile(target(key), "utf8"))
+        if (payload?.schemaVersion !== BRIDGE_SCHEMA_VERSION || payload?.sessionKey !== key) {
+          return null
+        }
+        return payload
+      } catch (error) {
+        if (error?.code === "ENOENT") return null
+        throw error
+      }
+    },
+    async write(key, changes) {
+      const current = await this.read(key)
+      const payload = {
+        schemaVersion: BRIDGE_SCHEMA_VERSION,
+        sessionKey: key,
+        directory,
+        goalId: "",
+        agentId: "",
+        registryPath: "",
+        availableCapabilities: [],
+        taskBody: "",
+        autoResume: true,
+        terminal: false,
+        schedulerToken: "",
+        unchangedPolls: 0,
+        lastInjectedPrompt: "",
+        updatedAt: new Date().toISOString(),
+        ...(current || {}),
+        ...changes,
+        updatedAt: new Date().toISOString(),
+      }
+      await fs.mkdir(root, { recursive: true, mode: 0o700 })
+      const destination = target(key)
+      const temporary = `${destination}.${process.pid}.${Date.now()}.tmp`
+      await fs.writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, {
+        encoding: "utf8",
+        mode: 0o600,
+      })
+      await fs.rename(temporary, destination)
+      return payload
+    },
+    async remove(key) {
+      try {
+        await fs.unlink(target(key))
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error
+      }
+    },
+  }
+}
+
+// Mirrors the OpenCode bridge probe: LoopX quota should-run is the only
+// continuation authority for the visible goal loop.
+export function buildQuotaArgs(binding) {
+  const args = []
+  if (binding.registryPath) args.push("--registry", binding.registryPath)
+  args.push(
+    "--format",
+    "json",
+    "quota",
+    "should-run",
+    "--goal-id",
+    binding.goalId,
+    "--runtime-profile",
+    "generic_cli",
+    "--include-detail",
+    "scheduler",
+  )
+  if (binding.agentId) args.push("--agent-id", binding.agentId)
+  for (const capability of binding.availableCapabilities || []) {
+    args.push("--available-capability", capability)
+  }
+  return args
+}
+
+export function isTerminalNoFollowup(decision) {
+  const frontier = decision?.goal_frontier_projection
+  const terminal = frontier?.terminal_state
+  const completeness = frontier?.source_completeness
+  return Boolean(
+    decision?.should_run === false &&
+      decision?.effective_action === "terminal_no_followup" &&
+      terminal?.schema_version === TERMINAL_STATE_SCHEMA_VERSION &&
+      terminal?.kind === "no_followup" &&
+      terminal?.derived === true &&
+      terminal?.source === "validated_goal_closure" &&
+      completeness?.schema_version === SOURCE_COMPLETENESS_SCHEMA_VERSION &&
+      completeness?.user_todos === "valid" &&
+      completeness?.agent_todos === "valid",
+  )
+}
+
+export function shouldRunNow(decision) {
+  const hint = decision?.scheduler_hint
+  return hint?.action === "run_now" || decision?.should_run === true
+}
+
+export function waitPlan(decision, binding) {
+  const hint = decision?.scheduler_hint || {}
+  const unchanged = hint?.unchanged_poll || {}
+  const local = unchanged?.local_scheduler
+  if (!local || local === "stop") {
+    return {
+      stop: true,
+      minutes: DEFAULT_RETRY_MINUTES,
+      schedulerToken: binding.schedulerToken,
+      unchangedPolls: binding.unchangedPolls,
+    }
+  }
+  const reset = hint?.reset_policy || {}
+  const token = String(reset?.reset_token || "")
+  const sameIdentity = Boolean(token) && token === binding.schedulerToken
+  const unchangedPolls = sameIdentity ? Number(binding.unchangedPolls || 0) : 0
+  const limit = Number.isInteger(local.unchanged_poll_limit)
+    ? Number(local.unchanged_poll_limit)
+    : null
+  if (limit !== null && unchangedPolls >= limit) {
+    return {
+      stop: true,
+      minutes: DEFAULT_RETRY_MINUTES,
+      schedulerToken: token,
+      unchangedPolls,
+    }
+  }
+  const progression = Array.isArray(local.example_progression_minutes)
+    ? local.example_progression_minutes.filter((value) => Number(value) > 0)
+    : []
+  const fallback = Number(local.recommended_interval_minutes || DEFAULT_RETRY_MINUTES)
+  const minutes = progression.length
+    ? Number(progression[Math.min(unchangedPolls, progression.length - 1)])
+    : fallback
+  return {
+    stop: false,
+    minutes: Number.isFinite(minutes) && minutes > 0 ? minutes : DEFAULT_RETRY_MINUTES,
+    schedulerToken: token,
+    unchangedPolls: unchangedPolls + 1,
+  }
+}
+
+// The quota-gated auto-continuation loop for one extension instance.
+//
+// options:
+//   quotaProbe(binding)      async LoopX quota should-run probe
+//   sendMessage(prompt)      inject the heartbeat task body as a follow-up
+//   setTimer(cb, delayMs)    schedule a timer, returns an opaque handle
+//   clearTimer(handle)       cancel a scheduled timer
+//
+// The loop keeps per-session timers and evaluations but owns one instance-wide
+// disposed flag, so session shutdown atomically invalidates every session's
+// scheduled work at once.
+export function createGoalLoop(options) {
+  const { quotaProbe, sendMessage, setTimer, clearTimer } = options
+  const timers = new Map()
+  const evaluations = new Map()
+  const contexts = new Map()
+  let disposed = false
+
+  const cancelScheduled = (key) => {
+    const timer = timers.get(key)
+    if (timer !== undefined) clearTimer(timer)
+    timers.delete(key)
+  }
+
+  const cancelAll = () => {
+    for (const timer of timers.values()) clearTimer(timer)
+    timers.clear()
+    evaluations.clear()
+  }
+
+  const scheduleEvaluation = (key, minutes) => {
+    if (disposed) return
+    cancelScheduled(key)
+    const timer = setTimer(async () => {
+      timers.delete(key)
+      if (disposed) return
+      try {
+        await evaluateIdle(key)
+      } catch {
+        // Evaluation must never crash the host; fail closed with a retry.
+        scheduleEvaluation(key, DEFAULT_RETRY_MINUTES)
+      }
+    }, Math.max(1, minutes) * 60_000)
+    timers.set(key, timer)
+  }
+
+  const evaluateIdleOnce = async (key) => {
+    if (disposed) return
+    const services = contexts.get(key)
+    if (!services) {
+      cancelScheduled(key)
+      return
+    }
+    const { store, isIdle } = services
+    let binding = null
+    try {
+      binding = await store.read(key)
+    } catch {
+      cancelScheduled(key)
+      return
+    }
+    if (!binding || binding.terminal) {
+      cancelScheduled(key)
+      return
+    }
+    if (binding.autoResume === false || !isIdle()) {
+      cancelScheduled(key)
+      return
+    }
+
+    let decision
+    try {
+      decision = await quotaProbe(binding)
+    } catch {
+      // Fail closed: never continue without LoopX authority. Bounded retry.
+      scheduleEvaluation(key, DEFAULT_RETRY_MINUTES)
+      return
+    }
+    if (disposed) return
+
+    const current = await store.read(key)
+    if (
+      !current ||
+      current.terminal ||
+      current.autoResume === false ||
+      current.goalId !== binding.goalId
+    ) {
+      cancelScheduled(key)
+      return
+    }
+
+    if (isTerminalNoFollowup(decision)) {
+      await store.write(key, { terminal: true, autoResume: false })
+      cancelScheduled(key)
+      services.notify(
+        `LoopX goal ${current.goalId} reached validated terminal no-follow-up; loop stopped.`,
+        "info",
+      )
+      return
+    }
+
+    if (shouldRunNow(decision)) {
+      cancelScheduled(key)
+      await store.write(key, { schedulerToken: "", unchangedPolls: 0 })
+      const prompt = current.taskBody || current.goalId
+      await store.write(key, { lastInjectedPrompt: prompt })
+      sendMessage(prompt)
+      return
+    }
+
+    const wait = waitPlan(decision, current)
+    if (wait.stop) {
+      cancelScheduled(key)
+      return
+    }
+    await store.write(key, {
+      schedulerToken: wait.schedulerToken,
+      unchangedPolls: wait.unchangedPolls,
+    })
+    scheduleEvaluation(key, wait.minutes)
+  }
+
+  const evaluateIdle = (key) => {
+    if (disposed) return Promise.resolve()
+    const existing = evaluations.get(key)
+    if (existing) return existing
+    const evaluation = evaluateIdleOnce(key).finally(() => {
+      if (evaluations.get(key) === evaluation) evaluations.delete(key)
+    })
+    evaluations.set(key, evaluation)
+    return evaluation
+  }
+
+  return {
+    // Bind the ctx-derived services (store, isIdle, notify) for a session key.
+    // Re-binding on every event keeps the loop free of host types while still
+    // using the freshest context available.
+    bind(key, services) {
+      contexts.set(key, services)
+    },
+    cancel(key) {
+      cancelScheduled(key)
+    },
+    async activate(key, fields) {
+      const services = contexts.get(key)
+      if (!services) throw new Error("loopx_goal_activate requires a bound session context")
+      const binding = await services.store.write(key, fields)
+      cancelScheduled(key)
+      services.notify(
+        `LoopX goal ${binding.goalId} activated; continuation gated by LoopX quota.`,
+        "info",
+      )
+      return binding
+    },
+    async settle(key) {
+      if (disposed) return
+      const services = contexts.get(key)
+      if (!services) return
+      let binding = null
+      try {
+        binding = await services.store.read(key)
+      } catch {
+        return
+      }
+      if (!binding || binding.terminal || binding.autoResume === false) return
+      await evaluateIdle(key)
+    },
+    async userPrompt(key, prompt) {
+      if (disposed) return
+      const services = contexts.get(key)
+      if (!services) return
+      let binding = null
+      try {
+        binding = await services.store.read(key)
+      } catch {
+        return
+      }
+      if (!binding || binding.terminal) return
+      if (String(prompt || "") !== binding.lastInjectedPrompt) {
+        await services.store.write(key, { autoResume: false })
+        cancelScheduled(key)
+      }
+    },
+    async resume(key) {
+      const services = contexts.get(key)
+      if (!services) return null
+      const binding = await services.store.write(key, { autoResume: true, terminal: false })
+      cancelScheduled(key)
+      services.notify(`LoopX goal ${binding.goalId} auto-continuation resumed.`, "info")
+      return binding
+    },
+    // Session shutdown / session replacement: atomically invalidate this
+    // extension instance and cancel every timer. A quota probe that is
+    // already in flight returns to the disposed guard, so it cannot send the
+    // old task body or reschedule a timer past the boundary.
+    dispose() {
+      disposed = true
+      cancelAll()
+    },
+  }
+}

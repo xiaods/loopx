@@ -24,13 +24,23 @@ into a LoopX-governed visible goal loop.
 ## Install / uninstall
 
 ```bash
-loopx slash-commands --install --surface pi --project .
-loopx slash-commands --uninstall --surface pi --project .
+loopx slash-commands --install --surface pi --pi-project .
+loopx slash-commands --uninstall --surface pi --pi-project .
 ```
 
-Installs the self-contained extension to `.pi/extensions/loopx-goal.ts` in the
-project (loaded after project trust). Pi's extension loader aliases `typebox`
-and the `@earendil-works/*` packages, so no local `node_modules` are required.
+Installs two LoopX-managed files into the project (loaded after project
+trust):
+
+- `.pi/extensions/loopx-goal.ts` — the extension adapter that registers
+  `/loopx`, `loopx_goal_activate`, and the `agent_settled` loop wiring.
+- `.pi/extensions/pi-goal-loop-runtime.mjs` — the quota/wait/store loop core
+  (not auto-discovered as an extension; the adapter imports it directly).
+
+Pi's extension loader aliases `typebox` and the `@earendil-works/*` packages,
+so no local `node_modules` are required. The `--pi-project` flag points the
+installer at the target project so the command is correct even when run from
+another directory; `agent-onboard --agent-type pi --project <path>` emits the
+resolved project automatically.
 
 ## State
 
@@ -44,3 +54,9 @@ transcripts, credentials, or local session paths. Continuation is governed by
 LoopX quota; user prompts pause auto-resume; `/loopx resume` or re-activation
 re-arms it. No external writes happen without the active LoopX state or owner
 authorization.
+
+On `session_shutdown` (session switch, fork, or reload) the extension instance
+is atomically disposed: every timer is cancelled and an in-flight quota probe
+that returns afterwards stops at the disposed guard, so the old session can
+never inject a follow-up or reschedule past the reload / session-replacement
+boundary.

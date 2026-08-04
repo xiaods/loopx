@@ -7,6 +7,7 @@ from typing import Any
 
 from .opencode_goal_mode import plugin_source, runtime_source
 from .pi_goal_mode import extension_source as pi_extension_source
+from .pi_goal_mode import runtime_source as pi_runtime_source
 from .slash_commands import build_slash_command_catalog
 
 
@@ -519,6 +520,10 @@ def _pi_extension_path(project_root: Path) -> Path:
     return project_root / ".pi" / "extensions" / "loopx-goal.ts"
 
 
+def _pi_runtime_path(project_root: Path) -> Path:
+    return project_root / ".pi" / "extensions" / "pi-goal-loop-runtime.mjs"
+
+
 def install_slash_commands(
     *,
     execute: bool,
@@ -915,31 +920,41 @@ def install_slash_commands(
 
     if "pi" in effective_surfaces:
         extension_path = _pi_extension_path(pi_project_root)
+        runtime_path = _pi_runtime_path(pi_project_root)
         extension_content = pi_extension_source()
+        runtime_content = pi_runtime_source()
         if uninstall:
-            installed.append(
-                {
-                    "surface": "pi",
-                    "host_surfaces": ["pi"],
-                    "mechanism": "pi_goal_extension",
-                    "command": "/loopx",
-                    "path": str(extension_path),
-                    "status": _retire_status(extension_path, execute=execute),
-                    "invoke_as": ["/loopx", "loopx_goal_activate"],
-                }
-            )
+            for mechanism, path in (
+                ("pi_goal_extension", extension_path),
+                ("pi_goal_extension_runtime", runtime_path),
+            ):
+                installed.append(
+                    {
+                        "surface": "pi",
+                        "host_surfaces": ["pi"],
+                        "mechanism": mechanism,
+                        "command": "/loopx",
+                        "path": str(path),
+                        "status": _retire_status(path, execute=execute),
+                        "invoke_as": ["/loopx", "loopx_goal_activate"],
+                    }
+                )
         else:
-            installed.append(
-                {
-                    "surface": "pi",
-                    "host_surfaces": ["pi"],
-                    "mechanism": "pi_goal_extension",
-                    "command": "/loopx",
-                    "path": str(extension_path),
-                    "status": _target_status(extension_path, extension_content, execute=execute),
-                    "invoke_as": ["/loopx", "loopx_goal_activate"],
-                }
-            )
+            for mechanism, path, content in (
+                ("pi_goal_extension", extension_path, extension_content),
+                ("pi_goal_extension_runtime", runtime_path, runtime_content),
+            ):
+                installed.append(
+                    {
+                        "surface": "pi",
+                        "host_surfaces": ["pi"],
+                        "mechanism": mechanism,
+                        "command": "/loopx",
+                        "path": str(path),
+                        "status": _target_status(path, content, execute=execute),
+                        "invoke_as": ["/loopx", "loopx_goal_activate"],
+                    }
+                )
 
     status_counts: dict[str, int] = {}
     for item in installed:
@@ -966,6 +981,7 @@ def install_slash_commands(
             "opencode_plugin_path": str(opencode_root / "plugins" / "loopx-goal.js") if "opencode" in effective_surfaces and with_goal_bridge else None,
             "opencode_package_path": str(opencode_root / "package.json") if "opencode" in effective_surfaces and with_goal_bridge else None,
             "pi_extension_path": str(_pi_extension_path(pi_project_root)) if "pi" in effective_surfaces else None,
+            "pi_runtime_path": str(_pi_runtime_path(pi_project_root)) if "pi" in effective_surfaces else None,
             "status_counts": status_counts,
             "skip_policy": (
                 "Uninstall removes only LoopX-managed files; user files without a LoopX managed marker are preserved"
@@ -979,7 +995,7 @@ def install_slash_commands(
             "Explicit LoopX command-facade skills use agents/openai.yaml policy allow_implicit_invocation=false and remain distinct from richer workflow skills such as loopx-project.",
             "Claude Code discovers user skills from CLAUDE_HOME/skills and exposes each skill name as a slash command.",
             "The default all surface installs only OpenCode's static command facade; the executable goal bridge requires --with-goal-bridge.",
-            "The Pi surface is opt-in and installs the self-contained goal extension into the project's .pi/extensions/; it is not part of the default all surface.",
+            "The Pi surface is opt-in and installs the self-contained goal extension and its loop runtime into the project's .pi/extensions/; it is not part of the default all surface.",
             "The OpenCode goal bridge uses Bun-managed config-directory dependencies and must replace any direct goal-plugin registration.",
             "OpenCode bridge uninstall preserves package.json dependencies because they may be shared by user-owned local plugins.",
             "Uninstall is fail-closed: it retires only files carrying the LoopX managed marker and leaves user-owned files in place.",
@@ -1015,6 +1031,9 @@ def render_slash_command_install_markdown(payload: dict[str, Any]) -> str:
     pi_extension_path = payload.get("summary", {}).get("pi_extension_path")
     if pi_extension_path:
         lines.append(f"- pi extension: `{pi_extension_path}`")
+    pi_runtime_path = payload.get("summary", {}).get("pi_runtime_path")
+    if pi_runtime_path:
+        lines.append(f"- pi loop runtime: `{pi_runtime_path}`")
     counts = payload.get("summary", {}).get("status_counts") or {}
     if isinstance(counts, dict) and counts:
         count_text = ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))

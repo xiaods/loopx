@@ -405,12 +405,20 @@ def main() -> int:
         )
         assert pi_install["ok"] is True, pi_install
         pi_extension = pi_project / ".pi" / "extensions" / "loopx-goal.ts"
+        pi_runtime = pi_project / ".pi" / "extensions" / "pi-goal-loop-runtime.mjs"
         assert pi_install["summary"]["pi_extension_path"] == str(pi_extension.resolve()), pi_install
+        assert pi_install["summary"]["pi_runtime_path"] == str(pi_runtime.resolve()), pi_install
         assert pi_extension.is_file(), pi_extension
+        assert pi_runtime.is_file(), pi_runtime
         pi_extension_text = pi_extension.read_text(encoding="utf-8")
         assert "surface=pi-extension" in pi_extension_text, pi_install
         assert "loopx_goal_activate" in pi_extension_text, pi_install
-        assert "terminal_no_followup" in pi_extension_text, pi_install
+        assert "loop.dispose()" in pi_extension_text, pi_install
+        # The quota/wait/store loop core lives in the sibling runtime module;
+        # session shutdown disposes the whole extension instance.
+        pi_runtime_text = pi_runtime.read_text(encoding="utf-8")
+        assert "surface=pi-extension-runtime" in pi_runtime_text, pi_install
+        assert "terminal_no_followup" in pi_runtime_text, pi_install
 
         pi_uninstall = json.loads(
             run_cli(
@@ -426,6 +434,7 @@ def main() -> int:
         )
         assert pi_uninstall["ok"] is True, pi_uninstall
         assert not pi_extension.exists(), pi_uninstall
+        assert not pi_runtime.exists(), pi_uninstall
 
         # The default all surface never installs the Pi extension.
         pi_default = json.loads(
@@ -443,7 +452,9 @@ def main() -> int:
             ).stdout
         )
         assert pi_default["summary"]["pi_extension_path"] is None, pi_default
+        assert pi_default["summary"]["pi_runtime_path"] is None, pi_default
         assert not pi_extension.exists(), pi_default
+        assert not pi_runtime.exists(), pi_default
 
     print("slash-command-install-smoke ok")
     return 0

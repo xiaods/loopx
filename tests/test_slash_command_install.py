@@ -475,17 +475,26 @@ def test_pi_install_writes_self_contained_extension_into_project(
     assert payload["ok"] is True
     assert payload["effective_surfaces"] == ["pi"]
     extension = tmp_path / ".pi" / "extensions" / "loopx-goal.ts"
+    runtime = tmp_path / ".pi" / "extensions" / "pi-goal-loop-runtime.mjs"
     assert payload["summary"]["pi_extension_path"] == str(extension)
+    assert payload["summary"]["pi_runtime_path"] == str(runtime)
     assert _row(payload, "pi_goal_extension")["status"] == "created"
+    assert _row(payload, "pi_goal_extension_runtime")["status"] == "created"
     text = extension.read_text(encoding="utf-8")
     assert "loopx-managed-slash-command:v1 command=/loopx surface=pi-extension" in text
     assert 'pi.registerCommand("loopx"' in text
     assert "loopx_goal_activate" in text
-    assert "quota" in text
-    assert "should-run" in text
-    assert "--runtime-profile" in text
-    assert "terminal_no_followup" in text
     assert "agent_settled" in text
+    assert "pi.on(\"session_shutdown\"" in text
+    assert "loop.dispose()" in text
+    # The quota/wait/store loop core lives in the sibling runtime module so it
+    # is directly executable by node:test.
+    runtime_text = runtime.read_text(encoding="utf-8")
+    assert "surface=pi-extension-runtime" in runtime_text
+    assert "quota" in runtime_text
+    assert "should-run" in runtime_text
+    assert "--runtime-profile" in runtime_text
+    assert "terminal_no_followup" in runtime_text
     # The extension is self-contained: no package.json or node_modules needed.
     assert not (tmp_path / ".pi" / "extensions" / "package.json").exists()
 
@@ -501,7 +510,9 @@ def test_pi_install_does_not_touch_default_all_surfaces(tmp_path: Path) -> None:
 
     assert payload["effective_surfaces"] == ["codex", "claude-code", "opencode"]
     assert payload["summary"]["pi_extension_path"] is None
+    assert payload["summary"]["pi_runtime_path"] is None
     assert not (tmp_path / ".pi" / "extensions" / "loopx-goal.ts").exists()
+    assert not (tmp_path / ".pi" / "extensions" / "pi-goal-loop-runtime.mjs").exists()
 
 
 def test_pi_install_preserves_user_owned_extension(tmp_path: Path) -> None:
@@ -528,7 +539,9 @@ def test_pi_install_retires_managed_extension_on_uninstall(tmp_path: Path) -> No
         pi_project=str(tmp_path),
     )
     extension = tmp_path / ".pi" / "extensions" / "loopx-goal.ts"
+    runtime = tmp_path / ".pi" / "extensions" / "pi-goal-loop-runtime.mjs"
     assert extension.exists()
+    assert runtime.exists()
 
     payload = install_slash_commands(
         execute=True,
@@ -539,4 +552,6 @@ def test_pi_install_retires_managed_extension_on_uninstall(tmp_path: Path) -> No
 
     assert payload["ok"] is True
     assert not extension.exists()
+    assert not runtime.exists()
     assert _row(payload, "pi_goal_extension")["status"] == "retired_managed_file"
+    assert _row(payload, "pi_goal_extension_runtime")["status"] == "retired_managed_file"
