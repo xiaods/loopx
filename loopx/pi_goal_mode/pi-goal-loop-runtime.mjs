@@ -354,6 +354,11 @@ export function createGoalLoop(options) {
       return
     }
     const { store, isIdle } = services
+    // Every store write inside this evaluation can throw (disk error,
+    // permission denied). The timer callback already reschedules on error;
+    // this top-level catch gives the direct evaluation path the same
+    // fail-closed-with-retry contract.
+    try {
     let binding = null
     try {
       binding = await store.read(key)
@@ -462,6 +467,12 @@ export function createGoalLoop(options) {
     }
     if (disposed || epoch !== instanceEpoch) return
     scheduleEvaluation(key, wait.minutes)
+    } catch {
+      // Fail closed with bounded retry: any unhandled error (store write
+      // failure, etc.) must not break the evaluation chain permanently.
+      cancelScheduled(key)
+      scheduleEvaluation(key, DEFAULT_RETRY_MINUTES)
+    }
   }
 
   const evaluateIdle = (key) => {

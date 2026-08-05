@@ -822,6 +822,61 @@ test("file-backed store keeps two long-prefix session keys isolated", async () =
 })
 
 
+test("store write failure fails closed with a bounded retry", async () => {
+  const inner = createMemoryBindingStore()
+  let writeCalls = 0
+  const throwStore = {
+    async read(key) {
+      return inner.read(key)
+    },
+    async write(key, changes, expected) {
+      // Throw on the first evaluation write (activate's write is index 0).
+      if (writeCalls++ === 1) throw new Error("disk full")
+      return inner.write(key, changes, expected)
+    },
+    async remove(key) {
+      return inner.remove(key)
+    },
+  }
+  const calls = { send: 0, quota: 0, notify: 0 }
+  const scheduled = []
+  const loop = createGoalLoop({
+    quotaProbe: async () => {
+      calls.quota += 1
+      return { should_run: true, scheduler_hint: { action: "run_now" } }
+    },
+    sendMessage: () => {
+      calls.send += 1
+    },
+    setTimer: (cb, ms) => {
+      const t = { cb, cleared: false, delayMs: ms }
+      scheduled.push(t)
+      return t
+    },
+    clearTimer: (t) => {
+      t.cleared = true
+    },
+  })
+  loop.bind("session-throw", {
+    store: throwStore,
+    isIdle: () => true,
+    notify: () => {
+      calls.notify++
+    },
+  })
+
+  // activate writes (index 0) — succeeds.
+  await loop.activate("session-throw", { goalId: "goal-throw", taskBody: "body" })
+
+  // settle must not throw; the evaluation catches the store write failure
+  // and reschedules instead of propagating.
+  await loop.settle("session-throw")
+
+  assert.equal(calls.send, 0)
+  assert.ok(scheduled.length > 0, "store write failure must schedule a retry")
+})
+
+
 test("session key stays under the filename sanitization limit", () => {
   const longPath = "/" + "x".repeat(300) + "/" + "y".repeat(300) + ".json"
   const key = sessionKey(longPath)
