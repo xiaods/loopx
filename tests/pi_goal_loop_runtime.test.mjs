@@ -24,8 +24,19 @@ function memoryBindingStore() {
     async read(key) {
       return bindings.get(key) || null
     },
-    async write(key, changes) {
+    async write(key, changes, expected) {
       const current = bindings.get(key) || {}
+      if (expected) {
+        if (
+          expected.generation !== undefined &&
+          (current.generation || 0) !== expected.generation
+        ) {
+          return null
+        }
+        if (expected.goalId !== undefined && (current.goalId || "") !== expected.goalId) {
+          return null
+        }
+      }
       const value = {
         schemaVersion: BRIDGE_SCHEMA_VERSION,
         sessionKey: key,
@@ -37,6 +48,7 @@ function memoryBindingStore() {
         taskBody: "",
         autoResume: true,
         terminal: false,
+        generation: 0,
         schedulerToken: "",
         unchangedPolls: 0,
         lastInjectedPrompt: "",
@@ -107,9 +119,10 @@ function gatedStore() {
     store: {
       async read(key) {
         reads += 1
-        // settle's pre-check and evaluateIdleOnce's binding read happen before
-        // the probe; the third read is the post-probe read.
-        if (reads === 3) {
+        // activate's generation read, settle's pre-check and
+        // evaluateIdleOnce's binding read happen before the probe; the fourth
+        // read is the post-probe read.
+        if (reads === 4) {
           markPostProbeReadStarted()
           if (gate) await gate
         }
@@ -534,13 +547,13 @@ test("activation during a stale run_now branch prevents stale writes and message
     async read(key) {
       return inner.read(key)
     },
-    async write(key, changes) {
+    async write(key, changes, expected) {
       const index = writeCalls++
       if (index === 1) {
         markWriteBlocked()
         await gate
       }
-      return inner.write(key, changes)
+      return inner.write(key, changes, expected)
     },
     async remove(key) {
       return inner.remove(key)
@@ -600,6 +613,220 @@ test("activation during a stale run_now branch prevents stale writes and message
   const binding = await inner.read("session-race")
   assert.equal(binding.goalId, "new-goal")
   assert.notEqual(binding.lastInjectedPrompt, "old-body")
+})
+
+
+test("activation during a stale terminal write cannot stop the new goal", async () => {
+  // The old goal's terminal commit is blocked mid-flight; the same session
+  // activates a new goal, then the stale write is released. The store's
+  // compare-and-swap must reject the terminal commit so the new binding is
+  // not permanently stopped and no stale terminal notification is sent.
+  let releaseWrite
+  const gate = new Promise((resolve) => {
+    releaseWrite = resolve
+  })
+  const inner = createMemoryBindingStore()
+  let writeCalls = 0
+  let markWriteBlocked
+  const writeBlockedPromise = new Promise((resolve) => {
+    markWriteBlocked = resolve
+  })
+  const gatedStore = {
+    async read(key) {
+      return inner.read(key)
+    },
+    async write(key, changes, expected) {
+      const index = writeCalls++
+      if (index === 1) {
+        markWriteBlocked()
+        await gate
+      }
+      return inner.write(key, changes, expected)
+    },
+    async remove(key) {
+      return inner.remove(key)
+    },
+  }
+
+  const calls = { send: 0, quota: 0, notify: 0 }
+  const scheduled = []
+  const loop = createGoalLoop({
+    quotaProbe: async () => {
+      calls.quota += 1
+      return terminalDecision()
+    },
+    sendMessage: () => {
+      calls.send += 1
+    },
+    setTimer: (cb, ms) => {
+      const t = { cb, cleared: false, delayMs: ms }
+      scheduled.push(t)
+      return t
+    },
+    clearTimer: (t) => {
+      t.cleared = true
+    },
+  })
+  loop.bind("session-terminal-race", {
+    store: gatedStore,
+    isIdle: () => true,
+    notify: () => {
+      calls.notify++
+    },
+  })
+
+  await loop.activate("session-terminal-race", {
+    goalId: "old-goal",
+    taskBody: "old-body",
+  })
+  const notifyAfterActivate = calls.notify
+  assert.equal(notifyAfterActivate, 1)
+
+  const settled = loop.settle("session-terminal-race")
+  await writeBlockedPromise
+  assert.equal(calls.quota, 1)
+
+  // Re-activate the same session with a new goal while the terminal commit
+  // is still in-flight.
+  await loop.activate("session-terminal-race", {
+    goalId: "new-goal",
+    taskBody: "new-body",
+  })
+  assert.equal(calls.notify, notifyAfterActivate + 1)
+
+  releaseWrite()
+  await settled
+
+  // The stale terminal commit was rejected: the new goal stays alive, no
+  // extra notification is emitted, and no message or timer appears.
+  assert.equal(calls.notify, notifyAfterActivate + 1)
+  assert.equal(calls.send, 0)
+  assert.equal(scheduled.length, 0)
+  const binding = await inner.read("session-terminal-race")
+  assert.equal(binding.goalId, "new-goal")
+  assert.equal(binding.terminal, false)
+  assert.equal(binding.autoResume, true)
+})
+
+
+test("activation during a stale wait write prevents a stale timer", async () => {
+  let releaseWrite
+  const gate = new Promise((resolve) => {
+    releaseWrite = resolve
+  })
+  const inner = createMemoryBindingStore()
+  let writeCalls = 0
+  let markWriteBlocked
+  const writeBlockedPromise = new Promise((resolve) => {
+    markWriteBlocked = resolve
+  })
+  const gatedStore = {
+    async read(key) {
+      return inner.read(key)
+    },
+    async write(key, changes, expected) {
+      const index = writeCalls++
+      if (index === 1) {
+        markWriteBlocked()
+        await gate
+      }
+      return inner.write(key, changes, expected)
+    },
+    async remove(key) {
+      return inner.remove(key)
+    },
+  }
+
+  const calls = { send: 0, quota: 0, notify: 0 }
+  const scheduled = []
+  const loop = createGoalLoop({
+    quotaProbe: async () => {
+      calls.quota += 1
+      return backoffDecision()
+    },
+    sendMessage: () => {
+      calls.send += 1
+    },
+    setTimer: (cb, ms) => {
+      const t = { cb, cleared: false, delayMs: ms }
+      scheduled.push(t)
+      return t
+    },
+    clearTimer: (t) => {
+      t.cleared = true
+    },
+  })
+  loop.bind("session-wait-race", {
+    store: gatedStore,
+    isIdle: () => true,
+    notify: () => {
+      calls.notify++
+    },
+  })
+
+  await loop.activate("session-wait-race", {
+    goalId: "old-goal",
+    taskBody: "old-body",
+  })
+
+  const settled = loop.settle("session-wait-race")
+  await writeBlockedPromise
+  assert.equal(calls.quota, 1)
+
+  await loop.activate("session-wait-race", {
+    goalId: "new-goal",
+    taskBody: "new-body",
+  })
+
+  releaseWrite()
+  await settled
+
+  // The stale wait commit was rejected: no backoff timer is scheduled for
+  // the old goal and the new binding keeps its identity.
+  assert.equal(scheduled.length, 0)
+  assert.equal(calls.send, 0)
+  const binding = await inner.read("session-wait-race")
+  assert.equal(binding.goalId, "new-goal")
+})
+
+
+test("file-backed store keeps two long-prefix session keys isolated", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-goal-loop-key-"))
+  try {
+    const store = createBindingStore(root)
+    // Both session files share a >160-char basename prefix and differ only
+    // after the old truncation point; the digest must keep the keys apart.
+    const shared = "/" + "p".repeat(200) + "/"
+    const baseA = "s".repeat(170) + "a"
+    const baseB = "s".repeat(170) + "b"
+    const keyA = sessionKey(shared + baseA + ".json")
+    const keyB = sessionKey(shared + baseB + ".json")
+    assert.notEqual(keyA, keyB)
+
+    // The digest suffix must survive filename sanitization, so each key gets
+    // its own target file and the bindings never shadow each other.
+    await store.write(keyA, { goalId: "goal-a", taskBody: "body-a" })
+    assert.equal((await store.read(keyA)).goalId, "goal-a")
+
+    await store.write(keyB, { goalId: "goal-b", taskBody: "body-b" })
+    assert.equal((await store.read(keyA)).goalId, "goal-a")
+    assert.equal((await store.read(keyB)).goalId, "goal-b")
+
+    // Bidirectional round-trip: removing A leaves B untouched.
+    await store.remove(keyA)
+    assert.equal(await store.read(keyA), null)
+    assert.equal((await store.read(keyB)).goalId, "goal-b")
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+
+test("session key stays under the filename sanitization limit", () => {
+  const longPath = "/" + "x".repeat(300) + "/" + "y".repeat(300) + ".json"
+  const key = sessionKey(longPath)
+  assert.ok(key.length < 160)
+  assert.match(key, /-[0-9a-f]{16}$/)
 })
 
 

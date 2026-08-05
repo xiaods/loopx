@@ -75,13 +75,9 @@ export default function (pi: ExtensionAPI) {
     // never produce the same durable key.
     return file ? sessionKey(file) : ephemeral.key;
   };
-  // Sessions without a session file (pi --no-session is ephemeral) get a
-  // unique in-memory identity per extension instance: the binding is never
-  // persisted, so a later run cannot inherit a previous run's goal.
-  const storeFor = (ctx: ExtensionContext) => {
-    const file = ctx.sessionManager.getSessionFile();
-    return file ? createBindingStore(ctx.cwd) : ephemeral.store;
-  };
+  // One stable store instance per key, so the runtime's per-key commit queue
+  // and compare-and-swap are shared across every event for the same session.
+  const stores = new Map<string, ReturnType<typeof createBindingStore>>();
 
   // One loop per extension instance. Session services (store, idle probe,
   // notify) are bound per key on every event, and `session_shutdown` disposes
@@ -101,12 +97,22 @@ export default function (pi: ExtensionAPI) {
     clearTimer: (timer: NodeJS.Timeout) => clearTimeout(timer),
   });
   // One unique, non-persisted identity per extension instance for ephemeral
-  // sessions; declared here so keyFor/storeFor stay stable within the run.
+  // sessions; declared here so keyFor stays stable within the run.
   const ephemeral = createEphemeralSessionIdentity();
 
   const bindContext = (ctx: ExtensionContext) => {
     const key = keyFor(ctx);
-    const store = storeFor(ctx);
+    const file = ctx.sessionManager.getSessionFile();
+    let store = ephemeral.store;
+    if (file) {
+      const cached = stores.get(key);
+      if (cached) {
+        store = cached;
+      } else {
+        store = createBindingStore(ctx.cwd);
+        stores.set(key, store);
+      }
+    }
     loop.bind(key, {
       store,
       isIdle: () => ctx.isIdle(),

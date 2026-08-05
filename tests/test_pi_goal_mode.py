@@ -49,14 +49,16 @@ def test_pi_extension_disposes_the_loop_on_session_shutdown() -> None:
     assert 'pi.on("session_shutdown"' in adapter
     # The runtime owns the instance-wide disposed guard after an in-flight
     # quota probe returns, and re-checks the same epoch after every await that
-    # can yield to the event loop (post-probe read, writes). Per-key generation
-    # catches goal re-activation during a stale evaluation.
+    # can yield to the event loop (post-probe read, writes). Goal identity is
+    # enforced through the persisted generation: activate() bumps it and every
+    # evaluation write commits via the store's compare-and-swap.
     assert "disposed = true" in runtime
     assert "cancelAll()" in runtime
     assert "if (disposed) return" in runtime
     assert "epoch !== instanceEpoch" in runtime
-    assert "keyGenerations" in runtime
     assert "capturedGen" in runtime
+    assert "casMatches" in runtime
+    assert "expected" in runtime
 
 
 def test_pi_extension_never_self_declares_closure() -> None:
@@ -100,11 +102,12 @@ def test_pi_extension_uses_collision_resistant_session_keys() -> None:
     adapter = extension_source()
     runtime = runtime_source()
     # Durable session keys must digest the full path, not truncate to 160
-    # characters.
+    # characters, and the digest must survive filename sanitization.
     assert "sessionKey" in adapter
     assert "export function sessionKey" in runtime
     assert "createHash" in runtime
     assert "sha256" in runtime
+    assert "SESSION_KEY_LABEL_MAX" in runtime
 
 
 def test_pi_extension_binding_state_stays_private_and_scoped() -> None:

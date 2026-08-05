@@ -16,6 +16,12 @@
 //   an epoch guard before any write / notify / send / timer side effect, so it
 //   can never continue the old session past a reload / session-replacement
 //   boundary.
+// - Goal identity is a binding contract: every binding carries a per-session
+//   generation that activate() increments, and every evaluation write commits
+//   through the store's compare-and-swap (expected generation + goalId). A
+//   stale evaluation whose write was already in-flight when the same session
+//   activated a new goal is rejected at the store commit boundary, so it can
+//   never merge old terminal/scheduler state or send the old task body.
 // - Sessions without a session file (pi --no-session, ephemeral) use a unique
 //   in-memory identity per extension instance and are never persisted, so a
 //   later run cannot inherit the previous run's binding.
@@ -28,6 +34,12 @@ export const TERMINAL_STATE_SCHEMA_VERSION = "goal_terminal_state_v0"
 export const SOURCE_COMPLETENESS_SCHEMA_VERSION = "goal_terminal_source_completeness_v0"
 export const DEFAULT_RETRY_MINUTES = 3
 
+// The label prefix of a session key reserves room for the digest suffix so
+// that createBindingStore's filename sanitization (160 chars) can never cut
+// the digest off: label(48) + "-" + digest(16) = 65 chars.
+const SESSION_KEY_LABEL_MAX = 48
+const SESSION_KEY_DIGEST_LENGTH = 16
+
 export function sanitizedKey(value) {
   const cleaned = String(value || "")
     .replace(/[^A-Za-z0-9_-]/g, "_")
@@ -37,11 +49,14 @@ export function sanitizedKey(value) {
 
 // Collision-resistant session key from the full session file path. Uses a
 // short human-readable basename prefix plus a SHA-256 digest of the complete
-// path so two files whose first 161 bytes are identical never produce the
-// same durable key.
+// path, so two files whose first 161 bytes are identical never produce the
+// same durable key and the digest always survives filename sanitization.
 export function sessionKey(sessionFile) {
-  const digest = createHash("sha256").update(sessionFile).digest("hex").slice(0, 16)
-  const label = sanitizedKey(path.basename(sessionFile))
+  const digest = createHash("sha256")
+    .update(sessionFile)
+    .digest("hex")
+    .slice(0, SESSION_KEY_DIGEST_LENGTH)
+  const label = sanitizedKey(path.basename(sessionFile)).slice(0, SESSION_KEY_LABEL_MAX)
   return label ? `${label}-${digest}` : `session-${digest}`
 }
 
@@ -52,12 +67,58 @@ export function stateRoot(directory) {
   return path.join(directory, ".loopx", "pi")
 }
 
+function bindingDefaults(directory) {
+  return {
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
+    directory,
+    goalId: "",
+    agentId: "",
+    registryPath: "",
+    availableCapabilities: [],
+    taskBody: "",
+    autoResume: true,
+    terminal: false,
+    generation: 0,
+    schedulerToken: "",
+    unchangedPolls: 0,
+    lastInjectedPrompt: "",
+  }
+}
+
+function casMatches(current, expected) {
+  if (!expected) return true
+  if (expected.generation !== undefined && (current?.generation || 0) !== expected.generation) {
+    return false
+  }
+  if (expected.goalId !== undefined && (current?.goalId || "") !== expected.goalId) {
+    return false
+  }
+  return true
+}
+
 // File-backed binding store scoped to one project. Bindings live under the
 // gitignored `.loopx/` tree so they survive Pi restarts without touching
-// tracked repository state.
+// tracked repository state. Writes for one key are serialized through a queue,
+// and the optional `expected` argument turns a write into a compare-and-swap:
+// the commit is rejected (returns null) unless the persisted generation and
+// goalId still match, so a stale evaluation can never overwrite a newly
+// activated binding.
 export function createBindingStore(directory) {
   const root = stateRoot(directory)
   const target = (key) => path.join(root, `${sanitizedKey(key)}.json`)
+  const queues = new Map()
+  const enqueue = (key, task) => {
+    const previous = queues.get(key) || Promise.resolve()
+    const next = previous.then(task)
+    queues.set(
+      key,
+      next.then(
+        () => {},
+        () => {},
+      ),
+    )
+    return next
+  }
   return {
     async read(key) {
       try {
@@ -71,49 +132,43 @@ export function createBindingStore(directory) {
         throw error
       }
     },
-    async write(key, changes) {
-      const current = await this.read(key)
-      const payload = {
-        schemaVersion: BRIDGE_SCHEMA_VERSION,
-        sessionKey: key,
-        directory,
-        goalId: "",
-        agentId: "",
-        registryPath: "",
-        availableCapabilities: [],
-        taskBody: "",
-        autoResume: true,
-        terminal: false,
-        schedulerToken: "",
-        unchangedPolls: 0,
-        lastInjectedPrompt: "",
-        updatedAt: new Date().toISOString(),
-        ...(current || {}),
-        ...changes,
-        updatedAt: new Date().toISOString(),
-      }
-      await fs.mkdir(root, { recursive: true, mode: 0o700 })
-      const destination = target(key)
-      const temporary = `${destination}.${process.pid}.${Date.now()}.tmp`
-      await fs.writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, {
-        encoding: "utf8",
-        mode: 0o600,
+    async write(key, changes, expected) {
+      return enqueue(key, async () => {
+        const current = await this.read(key)
+        if (!casMatches(current, expected)) return null
+        const payload = {
+          ...bindingDefaults(directory),
+          sessionKey: key,
+          ...(current || {}),
+          ...changes,
+          updatedAt: new Date().toISOString(),
+        }
+        await fs.mkdir(root, { recursive: true, mode: 0o700 })
+        const destination = target(key)
+        const temporary = `${destination}.${process.pid}.${Date.now()}.tmp`
+        await fs.writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, {
+          encoding: "utf8",
+          mode: 0o600,
+        })
+        await fs.rename(temporary, destination)
+        return payload
       })
-      await fs.rename(temporary, destination)
-      return payload
     },
     async remove(key) {
-      try {
-        await fs.unlink(target(key))
-      } catch (error) {
-        if (error?.code !== "ENOENT") throw error
-      }
+      return enqueue(key, async () => {
+        try {
+          await fs.unlink(target(key))
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error
+        }
+      })
     },
   }
 }
 
 // In-memory binding store for ephemeral sessions: nothing ever reaches the
 // filesystem, so a `pi --no-session` run cannot leak a binding to a later run.
+// Single-threaded Map access makes the compare-and-swap atomic.
 export function createMemoryBindingStore() {
   const bindings = new Map()
   return {
@@ -121,22 +176,12 @@ export function createMemoryBindingStore() {
     async read(key) {
       return bindings.get(key) || null
     },
-    async write(key, changes) {
+    async write(key, changes, expected) {
       const current = bindings.get(key) || {}
+      if (!casMatches(current, expected)) return null
       const payload = {
-        schemaVersion: BRIDGE_SCHEMA_VERSION,
+        ...bindingDefaults(""),
         sessionKey: key,
-        directory: "",
-        goalId: "",
-        agentId: "",
-        registryPath: "",
-        availableCapabilities: [],
-        taskBody: "",
-        autoResume: true,
-        terminal: false,
-        schedulerToken: "",
-        unchangedPolls: 0,
-        lastInjectedPrompt: "",
         ...current,
         ...changes,
       }
@@ -258,18 +303,16 @@ export function waitPlan(decision, binding) {
 //
 // The loop keeps per-session timers and evaluations but owns one instance-wide
 // epoch, so session shutdown atomically invalidates every session's scheduled
-// and in-flight work at once. Every await that can return control to the event
-// loop is followed by an epoch check before any write / notify / send / timer
-// side effect.
+// and in-flight work at once. Goal identity is enforced through the binding's
+// persisted generation: activate() increments it and every evaluation write
+// commits via the store's compare-and-swap with the captured generation and
+// goalId, so a stale evaluation cannot commit past a re-activation even when
+// its write was already in-flight.
 export function createGoalLoop(options) {
   const { quotaProbe, sendMessage, setTimer, clearTimer } = options
   const timers = new Map()
   const evaluations = new Map()
   const contexts = new Map()
-  // Per-key generation: every activate() increments the generation for its
-  // key so that an evaluation already in-flight for the same key detects the
-  // mismatch before committing any stale write or sending an old task body.
-  const keyGenerations = new Map()
   let disposed = false
   let epoch = 0
 
@@ -328,10 +371,12 @@ export function createGoalLoop(options) {
       return
     }
 
-    // Capture the per-key generation so we can detect a re-activation that
-    // happens while this evaluation is in-flight.
-    const capturedGen = keyGenerations.get(key) || 0
+    // Capture the binding identity so every commit below can CAS against it:
+    // a re-activation that happens while this evaluation is in-flight bumps
+    // the persisted generation and rejects the stale commit.
+    const capturedGen = binding.generation || 0
     const capturedGoalId = binding.goalId
+    const expected = { generation: capturedGen, goalId: capturedGoalId }
 
     let decision
     try {
@@ -350,6 +395,7 @@ export function createGoalLoop(options) {
       !current ||
       current.terminal ||
       current.autoResume === false ||
+      current.generation !== capturedGen ||
       current.goalId !== capturedGoalId
     ) {
       cancelScheduled(key)
@@ -357,11 +403,14 @@ export function createGoalLoop(options) {
     }
 
     if (isTerminalNoFollowup(decision)) {
-      if (keyGenerations.get(key) !== capturedGen) {
+      // Commit through the store's compare-and-swap: if the same session
+      // activated a new goal while this write was in-flight, the commit is
+      // rejected and the new binding stays alive.
+      const committed = await store.write(key, { terminal: true, autoResume: false }, expected)
+      if (!committed) {
         cancelScheduled(key)
         return
       }
-      await store.write(key, { terminal: true, autoResume: false })
       if (disposed || epoch !== instanceEpoch) return
       cancelScheduled(key)
       services.notify(
@@ -373,20 +422,23 @@ export function createGoalLoop(options) {
 
     if (shouldRunNow(decision)) {
       cancelScheduled(key)
-      if (keyGenerations.get(key) !== capturedGen) return
-      await store.write(key, { schedulerToken: "", unchangedPolls: 0 })
-      // If the in-flight write raced with activate(), the generation has
-      // already moved; abort before any further side effect.
-      if (keyGenerations.get(key) !== capturedGen) {
+      const schedulerCommit = await store.write(
+        key,
+        { schedulerToken: "", unchangedPolls: 0 },
+        expected,
+      )
+      if (!schedulerCommit) {
         cancelScheduled(key)
         return
       }
       if (disposed || epoch !== instanceEpoch) return
       const prompt = current.taskBody || current.goalId
-      if (keyGenerations.get(key) !== capturedGen) return
-      await store.write(key, { lastInjectedPrompt: prompt })
+      const promptCommit = await store.write(key, { lastInjectedPrompt: prompt }, expected)
+      if (!promptCommit) {
+        cancelScheduled(key)
+        return
+      }
       if (disposed || epoch !== instanceEpoch) return
-      if (keyGenerations.get(key) !== capturedGen) return
       sendMessage(prompt)
       return
     }
@@ -396,14 +448,18 @@ export function createGoalLoop(options) {
       cancelScheduled(key)
       return
     }
-    if (keyGenerations.get(key) !== capturedGen) {
+    const waitCommit = await store.write(
+      key,
+      {
+        schedulerToken: wait.schedulerToken,
+        unchangedPolls: wait.unchangedPolls,
+      },
+      expected,
+    )
+    if (!waitCommit) {
       cancelScheduled(key)
       return
     }
-    await store.write(key, {
-      schedulerToken: wait.schedulerToken,
-      unchangedPolls: wait.unchangedPolls,
-    })
     if (disposed || epoch !== instanceEpoch) return
     scheduleEvaluation(key, wait.minutes)
   }
@@ -422,7 +478,8 @@ export function createGoalLoop(options) {
   return {
     // Bind the ctx-derived services (store, isIdle, notify) for a session key.
     // Re-binding on every event keeps the loop free of host types while still
-    // using the freshest context available.
+    // using the freshest context available. The adapter must pass one stable
+    // store instance per key so the store's per-key commit queue is shared.
     bind(key, services) {
       contexts.set(key, services)
     },
@@ -433,10 +490,11 @@ export function createGoalLoop(options) {
       if (disposed) return null
       const services = contexts.get(key)
       if (!services) throw new Error("loopx_goal_activate requires a bound session context")
-      // Increment the per-key generation so every in-flight evaluation for
-      // this key aborts before writing or sending its old task body.
-      keyGenerations.set(key, (keyGenerations.get(key) || 0) + 1)
-      const binding = await services.store.write(key, fields)
+      // Increment the persisted generation so every in-flight evaluation for
+      // this key is rejected at its next compare-and-swap commit.
+      const current = await services.store.read(key)
+      const generation = (current?.generation || 0) + 1
+      const binding = await services.store.write(key, { ...fields, generation })
       if (disposed) return null
       cancelScheduled(key)
       services.notify(
