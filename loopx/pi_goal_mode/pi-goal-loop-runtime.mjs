@@ -543,7 +543,9 @@ export function createGoalLoop(options) {
       if (disposed || epoch !== instanceEpoch) return
       if (!binding || binding.terminal) return
       if (String(prompt || "") !== binding.lastInjectedPrompt) {
-        await services.store.write(key, { autoResume: false })
+        const expected = { generation: binding.generation || 0, goalId: binding.goalId }
+        const committed = await services.store.write(key, { autoResume: false }, expected)
+        if (!committed) return
         if (disposed || epoch !== instanceEpoch) return
         cancelScheduled(key)
       }

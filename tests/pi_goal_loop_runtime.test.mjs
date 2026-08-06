@@ -934,3 +934,98 @@ test("sanitized key is stable and bounded", () => {
   assert.equal(sanitizedKey("a/b:c d"), "a_b_c_d")
   assert.equal(sanitizedKey("x".repeat(400)).length, 160)
 })
+
+test("stale userPrompt write after re-activate cannot pause new goal", async () => {
+  // The old goal's userPrompt write is blocked mid-flight; the same session
+  // activates a new goal and completes a settle cycle, which creates a new
+  // timer. When the old userPrompt write is released, the store's CAS must
+  // reject the stale autoResume=false commit so the new binding stays alive
+  // and its timer is not cancelled.
+  let releaseWrite
+  const gate = new Promise((resolve) => {
+    releaseWrite = resolve
+  })
+  const inner = createMemoryBindingStore()
+  let writeCalls = 0
+  let markWriteBlocked
+  const writeBlockedPromise = new Promise((resolve) => {
+    markWriteBlocked = resolve
+  })
+  const gatedStore = {
+    async read(key) {
+      return inner.read(key)
+    },
+    async write(key, changes, expected) {
+      const index = writeCalls++
+      if (index === 1) {
+        markWriteBlocked()
+        await gate
+      }
+      return inner.write(key, changes, expected)
+    },
+    async remove(key) {
+      return inner.remove(key)
+    },
+  }
+
+  const calls = { quota: 0, send: 0, notify: 0 }
+  const scheduled = []
+  const loop = createGoalLoop({
+    quotaProbe: async () => {
+      calls.quota += 1
+      return runNowDecision("new-body")
+    },
+    sendMessage: () => {
+      calls.send += 1
+    },
+    setTimer: (cb, ms) => {
+      const t = { cb, cleared: false, delayMs: ms }
+      scheduled.push(t)
+      return t
+    },
+    clearTimer: (t) => {
+      t.cleared = true
+    },
+  })
+  loop.bind("session-user-prompt-race", {
+    store: gatedStore,
+    isIdle: () => true,
+    notify: () => {
+      calls.notify++
+    },
+  })
+
+  await loop.activate("session-user-prompt-race", {
+    goalId: "old-goal",
+    taskBody: "old-body",
+  })
+  assert.equal(calls.notify, 1)
+
+  // userPrompt enters; after reading the old binding, its CAS write is
+  // blocked before committing autoResume=false.
+  const promptPromise = loop.userPrompt("session-user-prompt-race", "intervention")
+  await writeBlockedPromise
+
+  // Re-activate the same session with a new goal while the old userPrompt
+  // write is still in-flight, then settle to create a new timer.
+  await loop.activate("session-user-prompt-race", {
+    goalId: "new-goal",
+    taskBody: "new-body",
+  })
+  assert.equal(calls.notify, 2)
+  const settled = loop.settle("session-user-prompt-race")
+  await settled
+  assert.equal(calls.quota, 1)
+  const activeTimers = scheduled.filter((t) => !t.cleared).length
+  assert.equal(activeTimers, 1)
+
+  releaseWrite()
+  await promptPromise
+
+  // The stale userPrompt commit was rejected: the new goal stays alive
+  // with autoResume=true, no timer was cancelled, and no stale state leaked.
+  const binding = await inner.read("session-user-prompt-race")
+  assert.equal(binding.goalId, "new-goal")
+  assert.equal(binding.autoResume, true)
+  assert.equal(scheduled.filter((t) => !t.cleared).length, 1)
+})
