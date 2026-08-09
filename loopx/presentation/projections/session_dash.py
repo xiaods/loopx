@@ -176,7 +176,11 @@ def _goal_entry(
     )
     next_action = (
         _text(status_item.get("recommended_action"), limit=220)
-        or _text(latest_run.get("recommended_action"), limit=220)
+        or (
+            _text(latest_run.get("recommended_action"), limit=220)
+            if latest_run
+            else None
+        )
         or None
     )
 

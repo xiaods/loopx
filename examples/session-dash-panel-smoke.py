@@ -190,6 +190,64 @@ def test_focus_goal_id_narrows_the_fleet() -> None:
     assert projection["overview"]["goal_count"] == 1
 
 
+def test_goal_without_latest_run_does_not_crash() -> None:
+    # A goal can be present in run_history without any latest run and with no
+    # recommended_action on its attention item (live registries do this). The
+    # projection must not call .get() on the missing run and must surface a
+    # clean None next_action instead of raising.
+    status = _build_fleet_fixture()
+    status = dict(status)
+    run_history = dict(status.get("run_history") or {})
+    goals = [dict(g) for g in run_history.get("goals", []) if isinstance(g, dict)]
+    goals.append(
+        {
+            "id": "empty-run-goal",
+            "domain": "loopx-platform",
+            "status": "active-progress",
+            "lifecycle_phase": "adapter_running",
+            "registry_member": True,
+            "latest_runs": [],
+        }
+    )
+    run_history["goals"] = goals
+    status["run_history"] = run_history
+
+    agents = [
+        dict(a)
+        for a in (status.get("agent_management_projection") or {}).get("agents", [])
+    ]
+    agents.append(
+        {
+            "agent_id": "empty-run-agent",
+            "agent_model": "peer_v1",
+            "profile_role": "docs-validation",
+            "state": "active",
+            "next_action": None,
+            "last_activity_at": "2026-07-06T10:15:00Z",
+            "goal_ids": ["empty-run-goal"],
+        }
+    )
+    status["agent_management_projection"] = {
+        "schema_version": "agent_management_projection_v0",
+        "mode": "read_only",
+        "agents": agents,
+    }
+
+    projection = build_session_dash_projection(
+        status_payload=status,
+        run_history=status.get("run_history"),
+        todo_index=status.get("todo_index"),
+        agent_management=status.get("agent_management_projection"),
+        focus_goal_id="empty-run-goal",
+    )
+    session = next(s for s in projection["sessions"])
+    goal = session["goals"][0]
+    assert goal["goal_id"] == "empty-run-goal"
+    assert goal["next_action"] is None
+    assert goal["latest_run_at"] is None
+    assert goal["latest_classification"] is None
+
+
 def test_html_renders_human_focused_sections() -> None:
     projection = _build_sample_projection()
     html = render_session_dash_html(projection)
@@ -459,6 +517,7 @@ def test_live_server_withholds_private_endpoints() -> None:
 if __name__ == "__main__":
     test_projection_is_read_only_and_fleet_shaped()
     test_focus_goal_id_narrows_the_fleet()
+    test_goal_without_latest_run_does_not_crash()
     test_html_renders_human_focused_sections()
     test_html_escapes_and_passes_boundary_scan()
     test_boundary_scan_flags_private_material()
