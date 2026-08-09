@@ -161,6 +161,12 @@ def _goal_entry(
         or _text(run_goal.get("waiting_on"))
         or "auto"
     )
+    # ``codex`` is LoopX's classification for an agent-actionable lane; surface
+    # it with the host-neutral ``agent`` word so the panel reads the same for
+    # Codex, Pi, or any other agent host. Both words classify identically in
+    # the bucket logic below.
+    if waiting_on == "codex":
+        waiting_on = "agent"
     display_name = (
         _text(status_item.get("display_name"), limit=120)
         or _text(run_goal.get("display_name"), limit=120)

@@ -170,6 +170,13 @@ def test_projection_is_read_only_and_fleet_shaped() -> None:
     assert goal["open_agent_todos"] == 1
     assert goal["status_bucket"] == "active"
 
+    # ``codex`` waiting classification is surfaced host-neutral as ``agent``
+    # so the panel reads the same for Codex, Pi, or any agent host.
+    meta_session = next(s for s in sessions if s["session_id"] == "codex-main-control")
+    meta_goal = meta_session["goals"][0]
+    assert meta_goal["waiting_on"] == "agent"
+    assert meta_goal["waiting_on"] != "codex"
+
     # no internal machinery in the projection that humans can't read
     assert "truth_contract" not in projection
     assert "work_lane" not in projection
