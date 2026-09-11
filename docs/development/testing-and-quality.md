@@ -77,9 +77,11 @@ golden 来让测试通过。
 
 `python-tests.yml` publishes `merge-gate` for every pull request. Code,
 workflow, policy and unknown paths require the existing `pytest` aggregate
-(including TypeScript checks and both Python shards), Stage 2C correctness
+(including TypeScript checks and all four Python shards), Stage 2C correctness
 aggregate, and Windows tests to succeed. Failed, cancelled, missing or
-unexpectedly skipped results cannot pass the gate.
+unexpectedly skipped results cannot pass the gate. The client-only exception
+below retains common checks and substitutes packaged Dashboard qualification
+for unrelated backend jobs.
 
 For a change limited to allowlisted root Markdown or `docs/**/*.md`, the
 classifier explicitly skips the expensive core jobs and the aggregate checks
@@ -110,8 +112,22 @@ Changes to the classifier or workflow need both code-path and documentation-only
 qualification. Keep required check names stable and never require a
 workflow-level path-filtered check that cannot report on every PR.
 
+The [job exemption policy](ci-impact-selection.md) additionally permits pure
+Dashboard-client changes to skip backend Python/Windows and Stage2c, while
+requiring common checks and the real packaged Dashboard build/browser smoke.
+Mixed, prompt, dependency and unknown changes stay full. Full Python runs four
+complete shards and combines all four coverage files. The `ci:full` label forces
+full qualification; main stays full. No selected-only report impersonates full
+coverage. 新的前端豁免由目标分支已审阅的策略控制；CI 自身变更仍全量验证。
+
 PRs opened before activation may need a branch update to produce the new
 required check; an old green suite alone does not supply a missing aggregate.
+
+Browser waits must target the intended surface: a visible pending-message label
+and an accessibility live region may contain the same words. Use a scoped or
+exact locator and retain the bounded completion assertion; do not suppress a
+strict-mode ambiguity with a retry or a longer timeout. 浏览器等待应区分消息提示与
+无障碍播报，不能把定位歧义误报成恢复超时，也不能通过删掉播报来让测试通过。
 
 ### Refactor Real-Path Gate / 重构真实路径门
 
@@ -335,7 +351,7 @@ network latency, provider availability, or a two-hour matrix.
 它刻意不包含真实模型调用和 full smoke catalog，因此普通迭代不依赖凭证、网络
 时延、模型服务可用性或两小时级测试矩阵。
 
-The Linux suite uses two hosted runners with two xdist workers each.
+The Linux suite uses four hosted runners with two xdist workers each.
 `pytest-split` partitions the complete collection using `least_duration`;
 without a timing file, tests have equal weight and alternate between shards.
 Lint, type checks, and the CLI budget run separately. The required `pytest`
@@ -345,18 +361,18 @@ individual shards. Relative coverage paths make reports portable across runners.
 The reusable Sonar workflow consumes that same run's XML and never reruns
 pytest or reads cross-run artifacts. Missing Sonar tokens still skip analysis
 successfully; test jobs receive no Sonar secret. The trigger is the union of
-the former Python and Sonar paths, so app-only and Sonar-configuration changes
-also run this lane, including on forks without a token.
+the former Python and Sonar paths. Client-only PRs use the exemption above;
+Sonar-configuration changes remain full, including on forks without a token.
 
-Linux 全套测试分到两台 hosted runner，每台保留两个 xdist worker。`pytest-split`
+Linux 全套测试分到四台 hosted runner，每台保留两个 xdist worker。`pytest-split`
 按完整 collection 分片；没有历史耗时时，等权测试交替分配。lint、类型检查和 CLI
 预算独立执行。必需的 `pytest` 汇总检查会拒绝失败／跳过的分片和缺失的 coverage，
 合并后再执行原有 19.6% 门槛；不要求单个分片达到全套覆盖率。coverage 使用相对路径，
 Sonar 只复用同一次 run 的 XML，不重复测试、不跨 run 取产物。缺少 token 仍成功跳过
-Sonar，测试 job 不接收 Sonar secret。触发范围取原有两套 workflow 的并集，因此仅改
-前端或 Sonar 配置也走此通道，包括没有 token 的 fork。
+Sonar，测试 job 不接收 Sonar secret。触发范围取原有两套 workflow 的并集；纯前端
+PR 使用前述豁免，Sonar 配置变更仍全量运行，包括没有 token 的 fork。
 
-Reproduce one shard locally with `python -m pytest -q -n 2 --splits 2 --group 1
+Reproduce one shard locally with `python -m pytest -q -n 2 --splits 4 --group 1
 --splitting-algorithm least_duration --cov=loopx`. Omit the split arguments to
 run the complete suite locally. 全量本地测试仍省略分片参数即可。
 
@@ -817,6 +833,8 @@ vision replan 未关闭时不能提前结束 Goal；这不是完整 Claude/Codex
 ```bash
 # No provider call by default. Explicit release opt-in uses ARK_API_KEY from the environment.
 python3 scripts/qualify-claude-goal-release.py --release-live
+# A completed inventory stage must not hide unfinished integrity acceptance.
+python3 scripts/qualify-claude-goal-release.py --release-live --scenario replan
 ```
 
 This arm uses the same ledger specification, independent oracle and durable
@@ -855,6 +873,77 @@ checks LoopX accounting. Passing non-delivery fixtures does not qualify delivery
 The same delivery class must pass failed-validation rejection and committed
 response-loss recovery without duplicate spending or premature terminal closure.
 Do not relabel delivery work or weaken the independent oracle to pass a host test.
+
+The `replan` scenario starts from a real, settled filename-inventory Todo and its
+valid `vision_closed` stage decision, not a fabricated missing writeback. The
+business specification still requires file sizes, checksums and a read-only
+integrity verifier. It requires an explicit successor vision/path decision,
+completed concrete successor work and terminal readback. The independent oracle
+checks actual hashes and sizes, then changes, removes and adds files in disposable
+copies; a verifier that silently regenerates its evidence fails. The original
+inventory must retain exactly one spend. This complements the finite delivery
+scenario: a model that simply closes every vision cannot pass both.
+The oracle does not require the literal final disposition `replan`: after the
+new successor has actually delivered, `no_followup` + `stop` is a valid scoped
+decision. It must still pass independent artifact, new successor, durable receipt
+and fresh terminal checks; `vision_closed` + `stop` is not Goal closure.
+
+`replan` 场景从真实完成并结算、具有有效 `vision_closed` 判断的“文件名清单”阶段启动，
+但完整验收仍缺少大小、校验和与只读校验器。测试要求后继 vision/显式路径调整、
+具体后继交付及最终终态；独立验收在一次性副本里篡改、删除、新增文件，拒绝通过
+自动重建清单掩盖错误。每个 Todo 必须恰好结算一次。后继真实交付后，最终路径可为
+`no_followup` + `stop`，不强求字面值 `replan`；`vision_closed` + `stop` 仍不是 Goal
+完成。两种场景都仅 release 前显式运行，普通 CI 不调用模型。
+
+### MCP vision authoring and recovery / MCP vision 写入与恢复
+
+The MCP guard projects `interaction_contract.mcp_channel`. For admitted normal
+Todo delivery, it replaces the raw CLI writeback/spend instructions with
+`complete_task` ownership; those are alternate transports, not two obligations.
+Replan-only and blocked lanes preserve their live CLI actions and binding.
+Vision field and total limits come from the same TS validator, not copied prompt
+constants. Quota admission, permission and workspace facts are unchanged.
+
+MCP 的普通 Todo 交付不再同时要求模型执行 CLI 记账和 MCP 结算两套流程；独立 replan
+仍使用动态 CLI 契约。vision 字段与预算直接来自 TS 校验器，不要求模型猜格式或翻测试。
+
+`complete_task` accepts either `agent_vision` (the existing bounded
+`goal_vision_replan_contract_v0` JSON packet) or `vision_unchanged_reason`.
+An unchanged decision needs a persisted valid baseline. The TypeScript host
+plan forwards that authored decision to its ordinary writeback; v1 requests
+fail closed against old runtimes instead of silently dropping the fields.
+Syntax and vision-budget preflight reuse the TS validator before lifecycle writes;
+baseline-dependent checks still run at writeback. Oversized authoring is a
+correctable input failure, not a terminal Goal failure. If an older/interrupted
+host already completed the Todo but failed writeback, retry `complete_task` with
+the same completion intent and a corrected uncommitted vision. Checkpoint-only
+recovery is not a substitute for unfinished settlement.
+
+If a previously completed MCP Todo omitted its decision, call
+`review_task_vision(todo_id, agent_id, agent_vision=...)` with that same Todo.
+It uses the original host Turn and the same writeback command constructor,
+delegating to the existing typed checkpoint recovery. It neither repeats Todo
+completion nor spends again. Exact replay is idempotent; a conflicting committed
+decision or a later superseding vision is rejected. It does not change Next
+Action or erase other work, gates, or permissions. A genuinely new replan follows
+the current interaction contract under a fresh admitted binding, not an edit to
+an already committed decision. Claude Todo-less replan now projects that identity
+re-entry before any refresh/spend instructions; ordinary MCP Todo delivery is
+unchanged.
+
+Todo acceptance, settled accounting, checkpoint satisfaction and Goal termination
+are separate facts. `vision_closed` closes a stage and still requires a successor
+vision for an active Goal. `no_followup` is an authored scoped closure assertion,
+not a substitute for evidence; remaining acceptance gaps or gates still prevent
+terminal quota. Kernel validation does not independently prove arbitrary prose
+true, so behavior qualification must also inspect the delivered artifacts.
+
+MCP 可随完成操作携带 vision 判断，也可用 `review_task_vision` 在原 Turn 补齐遗漏。
+复用 TS 的既有恢复规则，不新增结算引擎、不重扣额度；已提交的判断不能偷偷改写。
+格式和预算预检在 Todo 完成前拒绝非法输入；若旧宿主已部分完成，则修正未提交的
+vision 并重试原 `complete_task`，不能用仅补 checkpoint 的操作替代未完成结算。
+“checkpoint 满足”不等于“Goal 完成”，`vision_closed` 只结束阶段，真实缺口仍须规划。
+外层任务只描述业务验收，LoopX 协议由宿主内层指令和工具承接。
 
 ## Exact Release Commit Gate / 精确发布 Commit 门
 

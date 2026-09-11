@@ -7,6 +7,8 @@ import {
   type SettlementIdentity,
 } from "../effect_program.ts";
 import { EffectRuntimeRequestError } from "../effect_runtime_errors.ts";
+import { normalizeVisionUnchangedReason } from "../goals/vision_checkpoint.ts";
+import { projectMcpInteraction } from "./host_interaction.ts";
 import {
   requireBoolean,
   requireJsonObject,
@@ -17,12 +19,14 @@ import {
 
 export const HOST_TODO_COMPLETION_TRANSACTION_SCHEMA_VERSION =
   "loopx_host_todo_completion_transaction_v0";
+export const HOST_TODO_VISION_TRANSACTION_SCHEMA_VERSION =
+  "loopx_host_todo_completion_transaction_v1";
 export const HOST_TODO_COMPLETION_REDUCTION_SCHEMA_VERSION =
   "loopx_host_todo_completion_reduction_v0";
 export const HOST_ADAPTER_SETTLEMENT_SCHEMA_VERSION =
   "host_adapter_todo_settlement_v0";
 
-const PHASES = ["prepare", "finalize", "classify_guard"] as const;
+const PHASES = ["prepare", "finalize", "classify_guard", "vision_refresh", "project_guard"] as const;
 const STEP_KINDS = [
   "guard",
   "lifecycle_completion",
@@ -37,7 +41,7 @@ type HostTodoCompletionStepKind = (typeof STEP_KINDS)[number];
 type HostGuardState = "selected" | "terminal_no_selection" | "invalid";
 
 interface HostTodoCompletionRequest {
-  phase: Exclude<HostTodoCompletionPhase, "classify_guard">;
+  phase: Exclude<HostTodoCompletionPhase, "classify_guard" | "project_guard">;
   goal_id: string;
   agent_id: string;
   todo_id: string;
@@ -47,6 +51,8 @@ interface HostTodoCompletionRequest {
   execution_mode: string;
   completion_args: readonly string[];
   no_follow_up: boolean;
+  vision_path: string | null;
+  vision_unchanged_reason: string | null;
   provider_outcomes: readonly ProviderOutcome[];
 }
 
@@ -72,7 +78,7 @@ interface GuardSelection extends JsonObject {
 function decodePhase(value: JsonObject): HostTodoCompletionPhase {
   requireStringLiteral(
     value.schema_version,
-    [HOST_TODO_COMPLETION_TRANSACTION_SCHEMA_VERSION] as const,
+    [HOST_TODO_COMPLETION_TRANSACTION_SCHEMA_VERSION, HOST_TODO_VISION_TRANSACTION_SCHEMA_VERSION] as const,
     "schema_version",
     "schema_version is unsupported",
   );
@@ -116,9 +122,23 @@ function decodeProviderOutcomes(value: unknown): ProviderOutcome[] {
 
 function decodeRequest(
   value: JsonObject,
-  phase: Exclude<HostTodoCompletionPhase, "classify_guard">,
+  phase: Exclude<HostTodoCompletionPhase, "classify_guard" | "project_guard">,
 ): HostTodoCompletionRequest {
   const todoId = typedTodoId(value.todo_id, "todo_id");
+  const optionalText = (field: string): string | null => value[field] == null
+    ? null : requireNonEmptyString(value[field], field);
+  const visionPath = optionalText("vision_path");
+  const unchanged = normalizeVisionUnchangedReason(optionalText("vision_unchanged_reason"));
+  if (visionPath && unchanged) {
+    throw new EffectRuntimeRequestError("choose a vision patch or an unchanged reason, not both");
+  }
+  if ((visionPath || unchanged || phase === "vision_refresh") &&
+      value.schema_version !== HOST_TODO_VISION_TRANSACTION_SCHEMA_VERSION) {
+    throw new EffectRuntimeRequestError("host vision authoring requires v1");
+  }
+  if (phase === "vision_refresh" && !visionPath && !unchanged) {
+    throw new EffectRuntimeRequestError("vision refresh requires an authored decision");
+  }
   const request: HostTodoCompletionRequest = {
     phase,
     goal_id: requireNonEmptyString(value.goal_id, "goal_id"),
@@ -145,6 +165,8 @@ function decodeRequest(
       "completion_args",
     ),
     no_follow_up: requireBoolean(value.no_follow_up, "no_follow_up"),
+    vision_path: visionPath,
+    vision_unchanged_reason: unchanged,
     provider_outcomes: [],
   };
   if (phase === "finalize") {
@@ -303,6 +325,22 @@ function spendContinueWhen(identity: JsonObject): JsonObject {
   );
 }
 
+// One command owner for first delivery and checkpoint-only recovery. The CLI's
+// typed refresh recovery validates the original intent, baseline and revision;
+// this projection neither invents a vision nor changes Todo/Goal terminal state.
+function writebackArgs(request: HostTodoCompletionRequest, identity: JsonObject): string[] {
+  return [
+    "refresh-state", "--goal-id", request.goal_id, "--agent-id", request.agent_id,
+    "--classification", "mcp_completed_turn_writeback",
+    "--delivery-batch-scale", "single_surface", "--delivery-outcome", "outcome_progress",
+    "--todo-id", request.todo_id, "--turn-instance-id", String(identity.turn_instance_id),
+    "--completion-todo-id", request.todo_id, "--completion-turn-key", String(identity.effect_id),
+    "--no-global-sync", "--suppress-external-sinks",
+    ...(request.vision_path ? ["--agent-vision-json", request.vision_path] : []),
+    ...(request.vision_unchanged_reason ? ["--vision-unchanged-reason", request.vision_unchanged_reason] : []),
+  ];
+}
+
 function providerSteps(
   request: HostTodoCompletionRequest,
   identity: JsonObject,
@@ -346,29 +384,7 @@ function providerSteps(
     },
     {
       step_kind: "durable_writeback",
-      args: [
-        "refresh-state",
-        "--goal-id",
-        request.goal_id,
-        "--agent-id",
-        request.agent_id,
-        "--classification",
-        "mcp_completed_turn_writeback",
-        "--delivery-batch-scale",
-        "single_surface",
-        "--delivery-outcome",
-        "outcome_progress",
-        "--todo-id",
-        request.todo_id,
-        "--turn-instance-id",
-        turnId,
-        "--completion-todo-id",
-        request.todo_id,
-        "--completion-turn-key",
-        String(identity.effect_id),
-        "--no-global-sync",
-        "--suppress-external-sinks",
-      ],
+      args: writebackArgs(request, identity),
       legacy_args: null,
       continue_when: writebackContinueWhen(identity),
     },
@@ -627,6 +643,14 @@ function blockedResult(
     settlement,
   };
   if (options.completion) result.completion = options.completion;
+  if (options.completion?.completed === true &&
+      (request.vision_path !== null || request.vision_unchanged_reason !== null)) {
+    result.recovery = {
+      tool: "complete_task", todo_id: request.todo_id,
+      settlement_identity: expectedIdentity(request).payload,
+      instruction: "After correcting the reported error, retry complete_task with the same Todo, evidence and successor/no-follow-up intent. Correct only an uncommitted vision decision; do not repeat work, create another successor, or manually spend. review_task_vision alone does not finish a pending settlement. Committed conflicts and authority failures must not be bypassed.",
+    };
+  }
   return result;
 }
 
@@ -906,11 +930,27 @@ function finalize(request: HostTodoCompletionRequest): JsonObject {
     settlement_identity: identity,
     completion: finalCompletion,
     settlement,
+    ...(request.vision_path !== null || request.vision_unchanged_reason !== null ? {
+      completion_scope: "todo",
+      goal_terminal: {
+        assessed: false,
+        authority: "should_run.interaction_contract",
+        next_tool: "should_run",
+        instruction: "Todo terminal_closeout/no_followup is not Goal completion. Obey the fresh Goal contract, including vision replan. A vision evidence timestamp predating completion does not make that live decision stale. If all scoped acceptance is verified, use the admitted replan path to author no_followup; do not invent filler work or silently drop the obligation.",
+      },
+    } : {}),
   });
 }
 
 export function evaluateHostTodoCompletion(value: JsonObject): JsonObject {
   const phase = decodePhase(value);
+  if (phase === "project_guard") {
+    if (value.schema_version !== HOST_TODO_VISION_TRANSACTION_SCHEMA_VERSION) {
+      throw new EffectRuntimeRequestError("host interaction projection requires v1");
+    }
+    return {schema_version: HOST_TODO_COMPLETION_REDUCTION_SCHEMA_VERSION, phase,
+      packet: projectMcpInteraction(requireJsonObject(value.packet, "packet"))};
+  }
   if (phase === "classify_guard") {
     if (typeof value.guard_output !== "string") {
       throw new EffectRuntimeRequestError("guard_output must be a string");
@@ -925,6 +965,12 @@ export function evaluateHostTodoCompletion(value: JsonObject): JsonObject {
   const request = decodeRequest(value, phase);
   if (phase === "finalize") return finalize(request);
   const { payload: identity } = expectedIdentity(request);
+  if (phase === "vision_refresh") {
+    return {
+      schema_version: HOST_TODO_COMPLETION_REDUCTION_SCHEMA_VERSION,
+      phase, identity, args: writebackArgs(request, identity),
+    };
+  }
   const steps = providerSteps(request, identity);
   return reduction(
     "prepare",

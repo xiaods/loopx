@@ -19,6 +19,7 @@ from .configuration_transaction import (
     require_expected_configuration_plan_revision,
 )
 from .configure_goal import configure_goal
+from .orchestration import subagent_model_configuration_options
 from .control_plane.goals.configure_goal_service import configure_goal_with_global_sync
 from .control_plane.goals.goal_vision_policy import (
     normalize_completed_todo_replan_threshold,
@@ -45,9 +46,27 @@ def _boolean_configuration(
     return value
 
 
+def _subagent_model_options(config: Mapping[str, Any]) -> dict[str, Any]:
+    if "model" not in config and "reasoning_effort" not in config:
+        return {}
+    model = config.get("model", "")
+    effort = config.get("reasoning_effort", "")
+    if not isinstance(model, str) or not isinstance(effort, str):
+        raise ValueError("child model and reasoning effort must be strings")
+    if not model:
+        if effort:
+            raise ValueError("child reasoning effort requires a model")
+        return subagent_model_configuration_options(None)
+    preference = {"model": model}
+    if effort:
+        preference["reasoning_effort"] = effort
+    return subagent_model_configuration_options(preference)
+
+
 def _multi_subagent_options(config: Mapping[str, Any]) -> dict[str, Any]:
+    model_options = _subagent_model_options(config)
     if not _boolean_configuration("multi_subagent", config, "enabled"):
-        return {"multi_subagent_feature": "off"}
+        return {"multi_subagent_feature": "off", **model_options}
     max_children = config.get("max_children", 4)
     if not isinstance(max_children, int) or isinstance(max_children, bool):
         raise TypeError("multi_subagent.max_children must be an integer")
@@ -60,6 +79,7 @@ def _multi_subagent_options(config: Mapping[str, Any]) -> dict[str, Any]:
         "multi_subagent_feature": "enabled",
         "max_children": max_children,
         "allowed_domains": domains,
+        **model_options,
     }
 
 
@@ -115,7 +135,13 @@ def _goal_capability_options(
     config = dict(configuration)
     allowed: dict[str, set[str]] = {
         "todo_replan_cadence": {"completed_todos"},
-        "multi_subagent": {"enabled", "max_children", "allowed_domains"},
+        "multi_subagent": {
+            "enabled",
+            "max_children",
+            "allowed_domains",
+            "model",
+            "reasoning_effort",
+        },
         "peer_task_coordination": {"coordinator_agent_id"},
         "explore_graph": {"enabled"},
         "explore_harness": {"enabled", "profile"},

@@ -56,12 +56,12 @@ from .execution_profile import (
 )
 from .explore_graph import compact_explore_graph_policy
 from .orchestration import (
-    DEFAULT_ORCHESTRATION_MODE,
     EXPLORE_HARNESS_PROFILES,
     MULTI_SUBAGENT_ORCHESTRATION_MODE,
     compact_orchestration_policy,
     compact_peer_task_coordination_policy,
     orchestration_policy_summary,
+    update_spawn_execution_policy,
 )
 from .quota import goal_quota_config
 from .registry import atomic_write_json, read_json, registry_goals
@@ -435,6 +435,9 @@ def configure_goal(
     orchestration_mode: str | None = None,
     spawn_allowed: bool | None = None,
     max_children: int | None = None,
+    subagent_model: str | None = None,
+    subagent_reasoning_effort: str | None = None,
+    clear_subagent_model_config: bool = False,
     allowed_domains: list[str] | None = None,
     clear_allowed_domains: bool = False,
     explore_harness_enabled: bool | None = None,
@@ -593,6 +596,12 @@ def configure_goal(
         raise ValueError(
             "--multi-subagent-feature cannot be combined with --orchestration-mode or --spawn-allowed; "
             "use --max-children/--allowed-domain for bounded feature settings"
+        )
+    if clear_subagent_model_config and (
+        subagent_model is not None or subagent_reasoning_effort is not None
+    ):
+        raise ValueError(
+            "--clear-subagent-model-config cannot be combined with model settings"
         )
     if explore_harness_profile is not None:
         explore_harness_profile = (
@@ -957,6 +966,9 @@ def configure_goal(
         or orchestration_mode is not None
         or spawn_allowed is not None
         or max_children is not None
+        or subagent_model is not None
+        or subagent_reasoning_effort is not None
+        or clear_subagent_model_config
         or allowed_domains is not None
         or clear_allowed_domains
         or explore_harness_enabled is not None
@@ -968,33 +980,19 @@ def configure_goal(
             if isinstance(goal.get("spawn_policy"), dict)
             else {}
         )
-        if multi_subagent_feature == "enabled":
-            spawn_policy["mode"] = MULTI_SUBAGENT_ORCHESTRATION_MODE
-            spawn_policy["allowed"] = True
-            if max_children is None:
-                existing_children = int(
-                    compact_orchestration_policy(spawn_policy).get("max_children") or 0
-                )
-                spawn_policy["max_children"] = (
-                    existing_children
-                    if existing_children > 0
-                    else DEFAULT_MULTI_SUBAGENT_MAX_CHILDREN
-                )
-        elif multi_subagent_feature == "off":
-            spawn_policy["mode"] = DEFAULT_ORCHESTRATION_MODE
-            spawn_policy["allowed"] = False
-            spawn_policy["max_children"] = 0
-            spawn_policy["allowed_domains"] = []
-        elif orchestration_mode is not None:
-            spawn_policy["mode"] = orchestration_mode
-        if spawn_allowed is not None:
-            spawn_policy["allowed"] = spawn_allowed
-        if max_children is not None:
-            spawn_policy["max_children"] = max_children
-        if clear_allowed_domains:
-            spawn_policy["allowed_domains"] = []
-        elif allowed_domains is not None:
-            spawn_policy["allowed_domains"] = allowed_domains
+        update_spawn_execution_policy(
+            spawn_policy,
+            multi_subagent_feature=multi_subagent_feature,
+            orchestration_mode=orchestration_mode,
+            spawn_allowed=spawn_allowed,
+            max_children=max_children,
+            subagent_model=subagent_model,
+            subagent_reasoning_effort=subagent_reasoning_effort,
+            clear_subagent_model_config=clear_subagent_model_config,
+            allowed_domains=allowed_domains,
+            clear_allowed_domains=clear_allowed_domains,
+            default_max_children=DEFAULT_MULTI_SUBAGENT_MAX_CHILDREN,
+        )
         if (
             explore_harness_enabled is not None
             or explore_harness_profile is not None

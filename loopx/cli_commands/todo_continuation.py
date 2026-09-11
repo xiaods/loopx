@@ -134,11 +134,7 @@ def handle_todo_continuation(args, *, registry_path, runtime_root_arg, output_fo
                 context_path = Path(args.from_context).expanduser().resolve()
                 with open(context_path, "r", encoding="utf-8") as f:
                     context = json.load(f)
-                # Merge context fields into the request.
-                for key in ["work_summary", "rationale", "source_refs", "approaches_tried",
-                            "next_steps", "files_touched", "key_decisions", "open_questions"]:
-                    if key in context:
-                        request[key] = context[key]
+                request["context"] = context
             else:
                 # Legacy: pass through rationale and source_refs.
                 if args.rationale:

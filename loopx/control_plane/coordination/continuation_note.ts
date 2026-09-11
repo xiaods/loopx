@@ -64,11 +64,7 @@ export interface ContinuationNoteValidation {
 // MUST match what the producer can generate — otherwise the final authority
 // accepts notes that no producer can create.
 //
-// Root-level allowed keys:
-const NOTE_ROOT_KEYS = new Set([
-  "kind",
-  "source_session",
-  "todo_facts",
+export const CONTINUATION_NOTE_CONTEXT_FIELDS = [
   "work_summary",
   "rationale",
   "source_refs",
@@ -77,6 +73,14 @@ const NOTE_ROOT_KEYS = new Set([
   "files_touched",
   "key_decisions",
   "open_questions",
+] as const;
+
+const CONTEXT_KEYS = new Set<string>(CONTINUATION_NOTE_CONTEXT_FIELDS);
+const NOTE_ROOT_KEYS = new Set<string>([
+  "kind",
+  "source_session",
+  "todo_facts",
+  ...CONTINUATION_NOTE_CONTEXT_FIELDS,
 ]);
 
 // Per-field max lengths. Must match buildContextFromInput bounds exactly.
@@ -108,12 +112,16 @@ function hasOnlyKeys(obj: Record<string, unknown>, allowed: Set<string>): boolea
   return Object.keys(obj).every(k => allowed.has(k));
 }
 
+function firstUnknownKey(obj: Record<string, unknown>, allowed: Set<string>): string | undefined {
+  return Object.keys(obj).find(key => !allowed.has(key));
+}
+
 function isApproachTried(value: unknown): value is ContinuationNoteApproachTried {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   if (!hasOnlyKeys(v, APPROACH_KEYS)) return false;
   return boundedString(v.approach, "approach", FIELD_MAX.approach) &&
-    ["success", "partial", "failed"].includes(String(v.outcome)) &&
+    typeof v.outcome === "string" && ["success", "partial", "failed"].includes(v.outcome) &&
     boundedString(v.reason, "reason", FIELD_MAX.reason);
 }
 
@@ -122,7 +130,7 @@ function isFileTouched(value: unknown): value is ContinuationNoteFileTouched {
   const v = value as Record<string, unknown>;
   if (!hasOnlyKeys(v, FILE_KEYS)) return false;
   return boundedString(v.path, "path", FIELD_MAX.path) &&
-    ["read", "edited", "created", "deleted"].includes(String(v.action)) &&
+    typeof v.action === "string" && ["read", "edited", "created", "deleted"].includes(v.action) &&
     (v.summary === undefined || boundedString(v.summary, "summary", FIELD_MAX.file_summary));
 }
 
@@ -132,6 +140,92 @@ function isDecision(value: unknown): value is ContinuationNoteDecision {
   if (!hasOnlyKeys(v, DECISION_KEYS)) return false;
   return boundedString(v.decision, "decision", FIELD_MAX.decision) &&
     boundedString(v.rationale, "decision_rationale", FIELD_MAX.decision_rationale);
+}
+
+function continuationContextError(context: JsonObject): string | null {
+  const unknown = firstUnknownKey(context, CONTEXT_KEYS);
+  if (unknown !== undefined) return `unknown continuation context field: ${unknown}`;
+  if (context.work_summary !== undefined &&
+      !boundedString(context.work_summary, "work_summary", FIELD_MAX.work_summary)) {
+    return `work_summary must be non-empty text of at most ${FIELD_MAX.work_summary} characters`;
+  }
+  if (context.rationale !== undefined &&
+      !boundedString(context.rationale, "rationale", FIELD_MAX.rationale)) {
+    return `rationale must be non-empty text of at most ${FIELD_MAX.rationale} characters`;
+  }
+  if (context.work_summary === undefined && context.rationale === undefined) {
+    return "provide at least one of: work_summary (rich context) or rationale (legacy)";
+  }
+  if (context.source_refs !== undefined && (!Array.isArray(context.source_refs) ||
+      context.source_refs.length > 20 ||
+      !context.source_refs.every(value => boundedString(value, "source_ref", FIELD_MAX.source_ref)))) {
+    return "source_refs must contain at most 20 non-empty strings of at most 180 characters";
+  }
+  if (context.approaches_tried !== undefined) {
+    if (!Array.isArray(context.approaches_tried) || context.approaches_tried.length > 20) {
+      return "approaches_tried must be an array of at most 20 entries";
+    }
+    for (const value of context.approaches_tried) {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return "approaches_tried entries must be objects";
+      }
+      const nestedUnknown = firstUnknownKey(value as Record<string, unknown>, APPROACH_KEYS);
+      if (nestedUnknown !== undefined) return `unknown approaches_tried field: ${nestedUnknown}`;
+      const entry = value as Record<string, unknown>;
+      if (typeof entry.outcome !== "string" || !["success", "partial", "failed"].includes(entry.outcome)) {
+        return "approaches_tried outcome must be success, partial, or failed";
+      }
+      if (!isApproachTried(value)) return "approaches_tried entries must contain bounded approach, outcome, and reason fields";
+    }
+  }
+  if (context.next_steps !== undefined && (!Array.isArray(context.next_steps) ||
+      context.next_steps.length > 20 ||
+      !context.next_steps.every(value => boundedString(value, "next_step", FIELD_MAX.next_step)))) {
+    return "next_steps must contain at most 20 non-empty strings of at most 300 characters";
+  }
+  if (context.files_touched !== undefined) {
+    if (!Array.isArray(context.files_touched) || context.files_touched.length > 50) {
+      return "files_touched must be an array of at most 50 entries";
+    }
+    for (const value of context.files_touched) {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return "files_touched entries must be objects";
+      }
+      const nestedUnknown = firstUnknownKey(value as Record<string, unknown>, FILE_KEYS);
+      if (nestedUnknown !== undefined) return `unknown files_touched field: ${nestedUnknown}`;
+      const entry = value as Record<string, unknown>;
+      if (typeof entry.action !== "string" || !["read", "edited", "created", "deleted"].includes(entry.action)) {
+        return "files_touched action must be read, edited, created, or deleted";
+      }
+      if (!isFileTouched(value)) return "files_touched entries must contain bounded path, action, and optional summary fields";
+    }
+  }
+  if (context.key_decisions !== undefined) {
+    if (!Array.isArray(context.key_decisions) || context.key_decisions.length > 20) {
+      return "key_decisions must be an array of at most 20 entries";
+    }
+    for (const value of context.key_decisions) {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return "key_decisions entries must be objects";
+      }
+      const nestedUnknown = firstUnknownKey(value as Record<string, unknown>, DECISION_KEYS);
+      if (nestedUnknown !== undefined) return `unknown key_decisions field: ${nestedUnknown}`;
+      if (!isDecision(value)) return "key_decisions entries must contain bounded decision and rationale fields";
+    }
+  }
+  if (context.open_questions !== undefined && (!Array.isArray(context.open_questions) ||
+      context.open_questions.length > 20 ||
+      !context.open_questions.every(value => boundedString(value, "open_question", FIELD_MAX.open_question)))) {
+    return "open_questions must contain at most 20 non-empty strings of at most 300 characters";
+  }
+  return null;
+}
+
+export function parseContinuationNoteContext(rawContext: unknown): ContinuationNoteContext {
+  const context = canonicalAuthorityObject(rawContext, "continuation context");
+  const error = continuationContextError(context);
+  if (error !== null) throw new Error(error);
+  return context as unknown as ContinuationNoteContext;
 }
 
 export function validateContinuationNote(
@@ -154,53 +248,15 @@ export function validateContinuationNote(
       !boundedString(parsed.source_session, "source_session", FIELD_MAX.source_session)) {
     return { valid: false, note: parsed, noteFacts: "" };
   }
-  // Must have at least one of: work_summary (rich) or rationale (legacy).
-  const hasSummary = boundedString(parsed.work_summary, "work_summary", FIELD_MAX.work_summary);
-  const hasRationale = boundedString(parsed.rationale, "rationale", FIELD_MAX.rationale);
-  if (!hasSummary && !hasRationale) {
-    return { valid: false, note: parsed, noteFacts: "" };
-  }
   // Reject unknown root keys — the schema is closed.
   if (!hasOnlyKeys(parsed as Record<string, unknown>, NOTE_ROOT_KEYS)) {
     return { valid: false, note: parsed, noteFacts: "" };
   }
-  // Validate rich fields when present.
-  if (parsed.approaches_tried !== undefined) {
-    if (!Array.isArray(parsed.approaches_tried) || parsed.approaches_tried.length > 20 ||
-        !parsed.approaches_tried.every(isApproachTried)) {
-      return { valid: false, note: parsed, noteFacts: "" };
-    }
+  const context: JsonObject = {};
+  for (const field of CONTINUATION_NOTE_CONTEXT_FIELDS) {
+    if (parsed[field] !== undefined) context[field] = parsed[field];
   }
-  if (parsed.next_steps !== undefined) {
-    if (!Array.isArray(parsed.next_steps) || parsed.next_steps.length > 20 ||
-        !parsed.next_steps.every(v => boundedString(v, "next_step", FIELD_MAX.next_step))) {
-      return { valid: false, note: parsed, noteFacts: "" };
-    }
-  }
-  if (parsed.files_touched !== undefined) {
-    if (!Array.isArray(parsed.files_touched) || parsed.files_touched.length > 50 ||
-        !parsed.files_touched.every(isFileTouched)) {
-      return { valid: false, note: parsed, noteFacts: "" };
-    }
-  }
-  if (parsed.key_decisions !== undefined) {
-    if (!Array.isArray(parsed.key_decisions) || parsed.key_decisions.length > 20 ||
-        !parsed.key_decisions.every(isDecision)) {
-      return { valid: false, note: parsed, noteFacts: "" };
-    }
-  }
-  if (parsed.open_questions !== undefined) {
-    if (!Array.isArray(parsed.open_questions) || parsed.open_questions.length > 20 ||
-        !parsed.open_questions.every(v => boundedString(v, "open_question", FIELD_MAX.open_question))) {
-      return { valid: false, note: parsed, noteFacts: "" };
-    }
-  }
-  if (parsed.source_refs !== undefined) {
-    if (!Array.isArray(parsed.source_refs) || parsed.source_refs.length > 20 ||
-        !parsed.source_refs.every(v => boundedString(v, "source_ref", FIELD_MAX.source_ref))) {
-      return { valid: false, note: parsed, noteFacts: "" };
-    }
-  }
+  if (continuationContextError(context) !== null) return { valid: false, note: parsed, noteFacts: "" };
   return {
     valid: true,
     note: parsed,

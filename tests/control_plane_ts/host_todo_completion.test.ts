@@ -8,9 +8,63 @@ import {
   HOST_ADAPTER_SETTLEMENT_SCHEMA_VERSION,
   HOST_TODO_COMPLETION_REDUCTION_SCHEMA_VERSION,
   HOST_TODO_COMPLETION_TRANSACTION_SCHEMA_VERSION,
+  HOST_TODO_VISION_TRANSACTION_SCHEMA_VERSION,
 } from "../../loopx/control_plane/turn_driver/host_todo_completion.ts";
 
 const todoId = "todo_abc123";
+
+test("vision refresh shares the original delivery command and identity without a spend", () => {
+  const authored = {schema_version: HOST_TODO_VISION_TRANSACTION_SCHEMA_VERSION,
+    vision_path: "fixture-vision.json"};
+  const first = prepare(authored);
+  const recovery = evaluateHostTodoCompletion(request("prepare", {...authored, phase: "vision_refresh"}));
+  const steps = (first.provider_effect as {steps: {step_kind: string; args: string[]}[]}).steps;
+  assert.deepEqual(recovery.args, steps.find(step => step.step_kind === "durable_writeback")!.args);
+  assert.deepEqual(recovery.identity, first.identity);
+  assert.equal(recovery.provider_effect, undefined);
+  assert.equal((recovery.args as string[]).includes("spend-slot"), false);
+  assert.equal((recovery.args as string[]).includes("--next-action"), false);
+});
+
+test("vision decisions require v1 and cannot combine patch with unchanged", () => {
+  assert.throws(() => prepare({vision_path: "vision.json"}), /requires v1/);
+  assert.throws(() => prepare({schema_version: HOST_TODO_VISION_TRANSACTION_SCHEMA_VERSION,
+    vision_path: "vision.json", vision_unchanged_reason: "unchanged"}), /not both/);
+  assert.throws(() => evaluateHostTodoCompletion(request("prepare", {
+    schema_version: HOST_TODO_VISION_TRANSACTION_SCHEMA_VERSION, phase: "vision_refresh",
+  })), /authored decision/);
+  const base = prepare();
+  assert.deepEqual(prepare({schema_version: HOST_TODO_VISION_TRANSACTION_SCHEMA_VERSION}), base);
+});
+
+test("unchanged vision authoring is validated before completion or recovery effects", () => {
+  for (const phase of ["prepare", "vision_refresh"] as const) {
+    const authored = {
+      schema_version: HOST_TODO_VISION_TRANSACTION_SCHEMA_VERSION,
+      phase,
+      vision_unchanged_reason: "x".repeat(241),
+    };
+    assert.throws(() => evaluateHostTodoCompletion(request("prepare", authored)),
+      /vision_unchanged_reason exceeds 240 chars/);
+    const reduced = evaluateHostTodoCompletion(request("prepare", {
+      ...authored, vision_unchanged_reason: `  ${"x".repeat(240)}  `,
+    }));
+    const args = phase === "vision_refresh" ? reduced.args :
+      (reduced.provider_effect as {steps: {step_kind: string; args: string[]}[]})
+        .steps.find(step => step.step_kind === "durable_writeback")!.args;
+    const command = args as string[];
+    assert.equal(command[command.indexOf("--vision-unchanged-reason") + 1], "x".repeat(240));
+  }
+});
+
+test("vision-aware Todo closeout never certifies Goal termination", () => {
+  const reduced = finalize(providerOutcomes(identityFrom(prepare())), {schema_version: HOST_TODO_VISION_TRANSACTION_SCHEMA_VERSION,
+    vision_path: "vision.json"});
+  assert.equal((reduced.result as Record<string, unknown>).completion_scope, "todo");
+  const terminal = (reduced.result as Record<string, unknown>).goal_terminal as Record<string, unknown>;
+  assert.equal(terminal.assessed, false);
+  assert.equal(terminal.next_tool, "should_run");
+});
 
 function request(
   phase: "prepare" | "finalize" | "classify_guard",

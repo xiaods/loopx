@@ -108,6 +108,18 @@ def capability_configuration_editor(
             "fields": [
                 _field("enabled", "Enabled", "boolean"),
                 _field(
+                    "model",
+                    "Child model",
+                    "text",
+                    description="For example gpt-5.6-luna. Blank clears the child model preference.",
+                ),
+                _field(
+                    "reasoning_effort",
+                    "Child reasoning effort",
+                    "text",
+                    description="For example max. Host support is checked at launch; requires a child model.",
+                ),
+                _field(
                     "max_children",
                     "Maximum children",
                     "number",
@@ -328,7 +340,7 @@ def _merge_goal_feature(
     entry["available_scopes"] = [*entry["available_scopes"], "goal"]
     entry["goal_feature_id"] = capability_id
     entry["availability"] = feature.get("availability")
-    for field in ("default", "current", "documentation"):
+    for field in ("default", "current", "documentation", "context_contribution"):
         if isinstance(feature.get(field), Mapping):
             entry[field] = deepcopy(feature[field])
     entry["configuration_editor"] = capability_configuration_editor(

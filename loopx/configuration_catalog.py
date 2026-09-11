@@ -4,6 +4,7 @@ import shlex
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from .control_plane.agent_context import agent_context_descriptor
 from .capabilities.configuration_ui import build_capability_configuration_catalog
 from .control_plane.goals.goal_vision_policy import completed_todo_replan_threshold
 
@@ -220,6 +221,7 @@ def build_goal_configuration_catalog(
             },
             {
                 "feature_id": "multi_subagent",
+                "context_contribution": agent_context_descriptor(),
                 "display_name": "Adaptive child capacity",
                 "availability": "supported_opt_in",
                 "default": {
@@ -231,6 +233,11 @@ def build_goal_configuration_catalog(
                     "enabled": feature_summary.get("multi_subagent") == "enabled",
                     "max_children": orchestration.get("max_children"),
                     "allowed_domains": list(orchestration.get("allowed_domains") or []),
+                    **(
+                        dict(orchestration["model_config"])
+                        if "model_config" in orchestration
+                        else {}
+                    ),
                 },
                 "required_inputs": {},
                 "consider_when": (

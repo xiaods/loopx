@@ -114,10 +114,10 @@ test("real Python CLI source/target processes use the file backend and do not au
       "--session-id", session, "--workspace", f.root, ...args], {encoding: "utf8", env: {...process.env, PYTHONPATH: process.cwd()}, timeout: 30000});
     assert.equal(run.error, undefined);
     assert.ok(run.stdout.trim().startsWith("{"), run.stderr + run.stdout);
-    return JSON.parse(run.stdout);
+    return {status: run.status, payload: JSON.parse(run.stdout)};
   };
   const unavailable = cli("inspect", "source");
-  assert.equal(unavailable.reason_code, "continuation_requires_canonical_authority", JSON.stringify(unavailable));
+  assert.equal(unavailable.payload.reason_code, "continuation_requires_canonical_authority", JSON.stringify(unavailable));
   // Isolated synthetic promoted state; no active owner goal is touched.
   const statePath = join(f.root, "ACTIVE_GOAL_STATE.md");
   await writeFile(statePath, "---\ngoal_id: goal-a\n---\n");
@@ -127,14 +127,37 @@ test("real Python CLI source/target processes use the file backend and do not au
       source_projection_sha256: "sha256:fixture", expected_shadow_provider_revision: "fixture"}});
   assert.equal(fenceResult.status, "applied", JSON.stringify(fenceResult));
   const source = cli("inspect", "source");
-  const saved = cli("prepare", "source", ["--operation-id", "prepare-cli", "--expected-revision", source.provider_revision,
+  const before = await f.store.loadAuthority();
+  assert.equal(before.status, "loaded");
+  if (before.status !== "loaded") throw new Error("missing fixture");
+  for (const [name, context, error] of [
+    ["wrong-type", {work_summary: "Keep this", next_steps: "must not disappear"}, /next_steps/],
+    ["unknown-key", {work_summary: "Keep this", unexpected_context: "must not disappear"}, /unexpected_context/],
+    ["unknown-nested-key", {work_summary: "Keep this",
+      files_touched: [{path: "src.ts", action: "read", unexpected_context: true}]}, /unexpected_context/],
+  ] as const) {
+    const contextPath = join(f.root, `${name}.json`);
+    await writeFile(contextPath, JSON.stringify(context));
+    const rejected = cli("prepare", "source", ["--operation-id", `prepare-${name}`,
+      "--expected-revision", source.payload.provider_revision, "--from-context", contextPath]);
+    assert.equal(rejected.status, 1, JSON.stringify(rejected.payload));
+    assert.equal(rejected.payload.ok, false, JSON.stringify(rejected.payload));
+    assert.match(String(rejected.payload.reason), error);
+    const after = await f.store.loadAuthority();
+    assert.equal(after.status, "loaded");
+    if (after.status !== "loaded") throw new Error("missing fixture");
+    assert.equal(after.provider_revision, before.provider_revision);
+    assert.equal((after.head.todos as Record<string, unknown>[])[0]?.note,
+      (before.head.todos as Record<string, unknown>[])[0]?.note);
+  }
+  const saved = cli("prepare", "source", ["--operation-id", "prepare-cli", "--expected-revision", source.payload.provider_revision,
     "--rationale", "Preserve the current authority boundary", "--source-ref", "artifact:decision.md"]);
-  assert.equal(saved.ok, true, JSON.stringify(saved));
+  assert.equal(saved.payload.ok, true, JSON.stringify(saved));
   const target = cli("inspect", "target");
-  assert.equal(target.can_adopt, true);
-  const adopted = cli("adopt", "target", ["--operation-id", "adopt-cli", "--expected-revision", target.provider_revision]);
-  assert.equal(adopted.ok, true, JSON.stringify(adopted));
-  assert.equal(adopted.current_authority_verified, true);
+  assert.equal(target.payload.can_adopt, true);
+  const adopted = cli("adopt", "target", ["--operation-id", "adopt-cli", "--expected-revision", target.payload.provider_revision]);
+  assert.equal(adopted.payload.ok, true, JSON.stringify(adopted));
+  assert.equal(adopted.payload.current_authority_verified, true);
 });
 
 test("CLI --format digest renders readable handoff summary", async t => {

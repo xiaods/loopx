@@ -21,8 +21,10 @@ import {executeCoordinationTodoUpdate} from "./todo_update.ts";
 import {executeCoordinationTodoClaim} from "./todo_claim.ts";
 import {
   CONTINUATION_NOTE_MARKER,
+  CONTINUATION_NOTE_CONTEXT_FIELDS,
   buildContinuationNote,
   computeContinuationTodoFacts,
+  parseContinuationNoteContext,
   validateContinuationNote,
   type ContinuationNoteContext,
   type ContinuationNoteValidation,
@@ -35,14 +37,6 @@ const reject = (reason_code: string, reason: string): JsonObject =>
 function bounded(value: unknown, name: string, max: number): string {
   if (typeof value !== "string" || !value.trim() || value.length > max) {
     throw new Error(`${name} must be non-empty text of at most ${max} characters`);
-  }
-  return value;
-}
-
-function optionalString(value: unknown, name: string, max: number): string | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "string" || !value.trim() || value.length > max) {
-    throw new Error(`${name} must be non-empty text of at most ${max} characters when provided`);
   }
   return value;
 }
@@ -75,68 +69,12 @@ async function availability(workspace: unknown, artifacts: unknown): Promise<Jso
 }
 
 function buildContextFromInput(input: JsonObject): ContinuationNoteContext {
-  // Rich context: prefer structured fields.
-  const context: Record<string, unknown> = {};
-  const workSummary = optionalString(input.work_summary, "work_summary", 2000);
-  if (workSummary) context.work_summary = workSummary;
-  // Legacy fallback: rationale + source_refs.
-  const rationale = optionalString(input.rationale, "rationale", 600);
-  if (rationale) context.rationale = rationale;
-  if (Array.isArray(input.source_refs)) {
-    if (input.source_refs.length > 20) throw new Error("at most 20 source_refs are supported");
-    context.source_refs = input.source_refs.map(v => bounded(v, "source reference", 180));
+  if (input.context !== undefined) return parseContinuationNoteContext(input.context);
+  const context: JsonObject = {};
+  for (const field of CONTINUATION_NOTE_CONTEXT_FIELDS) {
+    if (input[field] !== undefined && input[field] !== null) context[field] = input[field];
   }
-  if (Array.isArray(input.approaches_tried)) {
-    if (input.approaches_tried.length > 20) throw new Error("at most 20 approaches_tried are supported");
-    context.approaches_tried = input.approaches_tried.map(v => {
-      if (typeof v !== "object" || v === null) throw new Error("approaches_tried entries must be objects");
-      const e = v as Record<string, unknown>;
-      const outcome = String(e.outcome);
-      if (!["success", "partial", "failed"].includes(outcome)) {
-        throw new Error("approaches_tried outcome must be success, partial, or failed");
-      }
-      return {approach: bounded(e.approach, "approach", 300), outcome: outcome as "success" | "partial" | "failed",
-        reason: bounded(e.reason, "reason", 300)};
-    });
-  }
-  if (Array.isArray(input.next_steps)) {
-    if (input.next_steps.length > 20) throw new Error("at most 20 next_steps are supported");
-    context.next_steps = input.next_steps.map(v => bounded(v, "next_step", 300));
-  }
-  if (Array.isArray(input.files_touched)) {
-    if (input.files_touched.length > 50) throw new Error("at most 50 files_touched are supported");
-    context.files_touched = input.files_touched.map(v => {
-      if (typeof v !== "object" || v === null) throw new Error("files_touched entries must be objects");
-      const e = v as Record<string, unknown>;
-      const action = String(e.action);
-      if (!["read", "edited", "created", "deleted"].includes(action)) {
-        throw new Error("files_touched action must be read, edited, created, or deleted");
-      }
-      const entry: Record<string, unknown> = {path: bounded(e.path, "path", 240),
-        action: action as "read" | "edited" | "created" | "deleted"};
-      const summary = optionalString(e.summary, "file summary", 200);
-      if (summary) entry.summary = summary;
-      return entry;
-    });
-  }
-  if (Array.isArray(input.key_decisions)) {
-    if (input.key_decisions.length > 20) throw new Error("at most 20 key_decisions are supported");
-    context.key_decisions = input.key_decisions.map(v => {
-      if (typeof v !== "object" || v === null) throw new Error("key_decisions entries must be objects");
-      const e = v as Record<string, unknown>;
-      return {decision: bounded(e.decision, "decision", 300),
-        rationale: bounded(e.rationale, "decision rationale", 300)};
-    });
-  }
-  if (Array.isArray(input.open_questions)) {
-    if (input.open_questions.length > 20) throw new Error("at most 20 open_questions are supported");
-    context.open_questions = input.open_questions.map(v => bounded(v, "open_question", 300));
-  }
-  // Must have at least one of: work_summary or rationale.
-  if (!context.work_summary && !context.rationale) {
-    throw new Error("provide at least one of: work_summary (rich context) or rationale (legacy)");
-  }
-  return context;
+  return parseContinuationNoteContext(context);
 }
 
 export async function executeTodoContinuation(store: AuthorityStore, value: unknown): Promise<JsonObject> {
